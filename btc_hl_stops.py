@@ -41,13 +41,16 @@ btc_hl_stops.py — где стоят стопы BTC сейчас: Hyperliquid, 
   py btc_hl_stops.py widths hl_snapshots/hl_ГГГГММДД_ЧЧММ.json      — ширина окна 0,5/1/2%
   py btc_hl_stops.py sync                         — забрать снимки облачного сборщика
   py btc_hl_stops.py recompute latest             — столп 3 по последнему снимку
-  python btc_hl_stops.py collect [--mode auto]    — облачный сборщик (GitHub Actions), без расчёта
+  python btc_hl_stops.py collect [--mode auto]    — облачный сборщик (GitHub Actions)
+  py btc_hl_stops.py depth                        — проверка глубины ежедневного опроса
+  py btc_hl_stops.py sigmacheck                   — σ Binance против Coinbase
 
 Облачный сборщик (шаг 2а, репозиторий hinzorlov-web/btc-hl-collector): Supabase
 каждый день будит GitHub Actions, тот запускает collect и складывает сжатые
-снимки в data/hl/ГГГГ/ММ/. σ (Binance) в облаке не считается — столп 3
-считается на ноутбуке по снимку (recompute). σ — по дням, закрытым к моменту
-снимка.
+снимки в data/hl/ГГГГ/ММ/. Столп 3 считается прямо в облаке: σ — по дневным
+свечам Coinbase (Binance серверам GitHub отказывает), ряд — data/pillar3_daily.csv.
+Если Coinbase недоступен, снимок всё равно сохраняется, а столп считает ноутбук
+(recompute, σ по Binance). σ — по дням, закрытым к моменту снимка.
 """
 from __future__ import annotations
 
@@ -637,8 +640,8 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
             active: bool = True) -> int:
     """
-    Только сбор, без расчёта столпа (σ берётся с Binance, а Binance серверам
-    GitHub отказывает): позиции BTC, открытый интерес, цена, HLP.
+    Сбор позиций BTC, открытого интереса, цены, HLP и расчёт столпа 3
+    (σ по Coinbase — Binance серверам GitHub отказывает).
     auto: по воскресеньям (UTC), без списка держателей или если полному опросу
     больше 8 суток — полный опрос; иначе ежедневный: топ N + держатели BTC +
     (active) торговавшие за сутки. Список держателей обновляется каждый раз:
