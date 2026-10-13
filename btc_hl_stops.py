@@ -61,7 +61,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -87,6 +87,11 @@ REPO = "hinzorlov-web/btc-hl-collector"   # облачный сборщик (Git
 DATA_DIR = os.path.join(HERE, "data")       # куда пишет сборщик в репозитории
 KNOWN_FILE = None                           # путь к hl_known.json (сборщик задаёт свой)
 CUM_K = (1, 2, 4)                           # кумулятивная версия: пределы в дневных ходах
+COINBASE = "https://api.exchange.coinbase.com/products/BTC-USD/candles"   # σ в облаке (аудитор, 13.10)
+P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", "zone_short_pct",
+           "zone_long_pct", "zone_short_usd", "zone_long_usd", "acc_short", "acc_long", "top_short",
+           "top_long", "p3_wo_top_short", "p3_wo_top_long", "cum1", "cum2", "cum4",
+           "cover_long", "cover_short", "positions", "polled"]
 
 
 class Limiter:
@@ -476,6 +481,17 @@ def sigma_at(rows: list, snap_ms: int) -> float | None:
     return None if idx is None else TC.daily_vol([r[3] for r in rows], idx)
 
 
+def _cb_daily(days: int = 60) -> list:
+    """Дневные свечи BTC-USD Coinbase: (t_ms, high, low, close) по возрастанию.
+    Coinbase отдаёт [время_с, low, high, open, close, объём], новые первыми."""
+    end = datetime.now(timezone.utc)
+    r = requests.get(COINBASE, params={"granularity": 86400, "start": (end - timedelta(days=days)).isoformat(),
+                                       "end": end.isoformat()},
+                     headers={"User-Agent": "btc-hl-collector"}, timeout=30)
+    r.raise_for_status()
+    return sorted((int(c[0]) * 1000, float(c[2]), float(c[1]), float(c[4])) for c in r.json())
+
+
 def stamp_ms(stamp: str) -> int:
     return int(datetime.strptime(stamp[:13], "%Y%m%d_%H%M").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
@@ -583,18 +599,39 @@ LOG_COLS = ["utc", "kind", "polled", "positions", "errors", "minutes", "cover_lo
             "oi_btc", "mark", "active", "known", "t_start", "t_end"]
 
 
-def _append_log(path: str, row: dict) -> None:
-    """Журнал сбора; старый заголовок дополняется новыми колонками без потери строк."""
+def _append_csv(path: str, row: dict, cols: list) -> None:
+    """Дописать строку; старый заголовок дополняется новыми колонками без потери строк."""
     rows = []
     if os.path.isfile(path):
         with open(path, encoding="utf-8", newline="") as fh:
             rows = list(csv.DictReader(fh))
     rows.append(row)
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=LOG_COLS, restval="")
+        w = csv.DictWriter(fh, fieldnames=cols, restval="")
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in LOG_COLS})
+            w.writerow({k: r.get(k, "") for k in cols})
+
+
+def _append_log(path: str, row: dict) -> None:
+    _append_csv(path, row, LOG_COLS)
+
+
+def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dict:
+    """Строка ежедневного ряда столпа 3 (для индекса)."""
+    f = lambda x, n=4: "" if x is None else f"{x:.{n}f}"
+    sh, lo, c = s.get("short") or {}, s.get("long") or {}, s.get("cum") or {}
+    return {"utc": stamp, "kind": kind, "sigma": f(s["sigma"], 5), "sigma_src": sig_src,
+            "pillar3": f(s["pillar3"], 2), "p_short": f(sh.get("p7")), "p_long": f(lo.get("p7")),
+            "zone_short_pct": f(sh.get("dist_pct"), 2), "zone_long_pct": f(lo.get("dist_pct"), 2),
+            "zone_short_usd": f(sh.get("size_usd"), 0), "zone_long_usd": f(lo.get("size_usd"), 0),
+            "acc_short": sh.get("n_acc", ""), "acc_long": lo.get("n_acc", ""),
+            "top_short": f(sh.get("top_share"), 3), "top_long": f(lo.get("top_share"), 3),
+            "p3_wo_top_short": f(sh.get("p3_without_top"), 2), "p3_wo_top_long": f(lo.get("p3_without_top"), 2),
+            "cum1": f((c.get("1") or {}).get("value"), 2), "cum2": f((c.get("2") or {}).get("value"), 2),
+            "cum4": f((c.get("4") or {}).get("value"), 2),
+            "cover_long": f(s["cover_long"]), "cover_short": f(s["cover_short"]),
+            "positions": s["n_pos"], "polled": polled}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -640,6 +677,17 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
     stamp = now.strftime("%Y%m%d_%H%M")
     summary = {"oi_btc": P["oi"], "mark": P["mark"], "sigma": None, "n_pos": len(pos),
                "long_btc": L, "short_btc": S, "cover_long": L / P["oi"], "cover_short": S / P["oi"]}
+    # Столп 3 — прямо в облаке: σ по дневным свечам Coinbase (Binance серверам
+    # GitHub отказывает), кривая — p3_touch_curve.csv из репозитория. Сбой здесь
+    # не мешает сохранить снимок: тогда столп посчитает ноутбук (recompute).
+    sig_src, cpath = None, os.path.join(HERE, "p3_touch_curve.csv")
+    try:
+        sigma = sigma_at(_cb_daily(), stamp_ms(stamp))
+        if sigma and os.path.isfile(cpath):
+            summary = summarize(pos, P["oi"], P["mark"], sigma, MT.load_curve(cpath))
+            sig_src = summary["sigma_src"] = "coinbase"
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[!] Столп 3 в облаке не посчитан ({str(exc)[:80]}) — посчитает ноутбук")
     d = os.path.join(out, "hl", day[:4], day[4:6])
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"hl_{stamp}_{mode}.json.gz")
@@ -655,6 +703,13 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
         new_known = (ks - P["no_pos"]) | found
     with open(KNOWN_FILE, "w", encoding="utf-8") as fh:
         json.dump({"utc": stamp, "full_utc": full_utc, "addresses": sorted(new_known)}, fh)
+    if sig_src:
+        _append_csv(os.path.join(out, "pillar3_daily.csv"),
+                    pillar_row(stamp, mode, summary, sig_src, n), P3_COLS)
+        print(f"Столп 3 = {summary['pillar3']:+.1f}" if summary["pillar3"] is not None else "Столп 3: зоны нет",
+              f"(σ {100 * summary['sigma']:.2f}%, Coinbase); кумулятивная 1/2/4:",
+              " / ".join("—" if summary["cum"][str(k)]["value"] is None else f"{summary['cum'][str(k)]['value']:+.0f}"
+                         for k in CUM_K))
     _append_log(os.path.join(out, "hl_log.csv"), {
         "utc": stamp, "kind": mode, "polled": n, "positions": len(pos), "errors": P["errors"],
         "minutes": f"{P['minutes']:.1f}", "cover_long": f"{L / P['oi']:.4f}",
@@ -704,7 +759,8 @@ def sync() -> None:
                     json.dump(local, fh)
             with open(os.path.join(HERE, "hl_known.json"), "w", encoding="utf-8") as fh:
                 json.dump(cloud, fh)
-            print(f"Список держателей BTC обновлён из облака (полный опрос {cloud['utc']})")
+            print(f"Список держателей BTC обновлён из облака (на {cloud['utc']}, "
+                  f"полный опрос {cloud.get('full_utc', cloud['utc'])})")
 
 
 def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> None:
@@ -762,6 +818,36 @@ def lbstats() -> None:
         print(f"   окно {name:<8}: оборот > 0 у {st['vlm>0']:>6} счетов, PnL ≠ 0 у {st['pnl!=0']:>6}")
     if not wins:
         print("   [!] Поля windowPerformances нет — активность по таблице не определить")
+
+
+def sigmacheck(days: int = 60) -> None:
+    """σ за 30 дней: Binance BTCUSDT (кривая откалибрована на нём) против Coinbase BTC-USD (облако)."""
+    b, c = TC.load(False), _cb_daily(days + 40)
+    now = int(time.time() * 1000)
+    print("Дневной ход σ (30 дней), по дням, закрытым к 00:10 UTC:")
+    print(f"   {'дата':<12}{'Binance':>9}{'Coinbase':>10}{'разница':>9}")
+    diffs = []
+    for k in range(days, -1, -1):
+        t = (now // TC.DAY - k) * TC.DAY + 600_000
+        sb, sc = sigma_at(b, t), sigma_at(c, t)
+        if sb and sc:
+            diffs.append(sc / sb - 1)
+            if k < 10:
+                print(f"   {datetime.fromtimestamp(t / 1000, timezone.utc):%Y-%m-%d}  {100 * sb:>7.3f}%"
+                      f"{100 * sc:>9.3f}%{100 * (sc / sb - 1):>+8.1f}%")
+    if diffs:
+        print(f"   За {len(diffs)} дней: средняя разница {100 * sum(diffs) / len(diffs):+.2f}%, "
+              f"наибольшая по модулю {100 * max(diffs, key=abs):+.2f}%")
+
+
+def live_check() -> None:
+    """Живые запросы (аудитор, 13.10: заглушка разрешает то, что площадка отвергает)."""
+    oi, mark = btc_market()
+    n = len(leaderboard_rows())
+    cb = _cb_daily(40)
+    assert oi > 0 and mark > 0 and n > 1000 and len(cb) >= 31, (oi, mark, n, len(cb))
+    print(f"живая проверка: OK — Hyperliquid (OI {oi:,.0f} BTC, цена {mark:,.0f}), таблица лидеров "
+          f"{n} счетов, Coinbase {len(cb)} дневных свечей, σ {100 * sigma_at(cb, int(time.time() * 1000)):.2f}%")
 
 
 def latest_snapshot() -> str:
@@ -899,7 +985,8 @@ def selftest() -> None:
     import tempfile
     g = globals()
     saved = {k: g[k] for k in ("HERE", "SNAP_DIR", "post", "btc_market", "leaderboard_rows", "requests",
-                               "LIMIT", "CUTS", "HLP_VAULT", "KNOWN_FILE", "_gh_tree", "_gh_raw")}
+                               "LIMIT", "CUTS", "HLP_VAULT", "KNOWN_FILE", "_gh_tree", "_gh_raw",
+                               "_cb_daily")}
     saved_load = TC.load
     tmp = tempfile.mkdtemp(prefix="hl_selftest_")
     try:
@@ -942,6 +1029,7 @@ def selftest() -> None:
                  HLP_VAULT=parent)
         rows = [(k * TC.DAY, 84000.0, 84000.0, 84000.0 * math.exp(0.02 * (-1) ** k)) for k in range(60)]
         TC.load = lambda refresh=False: rows
+        g["_cb_daily"] = lambda days=60: rows
         print("--- подставная биржа: числа ниже выдуманные, проверяется только механика ---")
         run(0, 6)
         snaps = os.listdir(os.path.join(tmp, "snap"))
@@ -1019,6 +1107,11 @@ def selftest() -> None:
             kn = json.load(fh)
         assert kn["utc"] == "20261019_0010" and kn["full_utc"] == "20261018_0010"
         assert set(kn["addresses"]) == {p["addr"].lower() for p in dm["positions"] if p["rank"] >= 0}
+        # Столп 3 посчитан в облаке (σ «Coinbase») и записан в ежедневный ряд
+        assert dm["summary"]["sigma_src"] == "coinbase" and dm["summary"]["pillar3"] is not None
+        with open(os.path.join(out, "pillar3_daily.csv"), encoding="utf-8") as fh:
+            pr = list(csv.DictReader(fh))
+        assert [r["kind"] for r in pr] == ["full", "daily"] and pr[1]["cum2"] != ""
         # «Ноутбук»: забрать снимки из «облака» и посчитать столп по последнему
         tree = {"tree": [{"type": "blob",
                           "path": os.path.relpath(os.path.join(dp, f), tmp).replace(os.sep, "/")}
@@ -1066,6 +1159,18 @@ def selftest() -> None:
         g["requests"] = _Req
         print("\n--- таблица лидеров: активность ---")
         lbstats()
+        print("\n--- облако: Coinbase недоступен ---")
+        # Coinbase недоступен — снимок всё равно сохраняется, столп считает ноутбук
+        def _down(days=60):
+            raise RuntimeError("тест: Coinbase недоступен")
+        g["_cb_daily"] = _down
+        tue = datetime(2026, 10, 20, 0, 10, tzinfo=timezone.utc)
+        assert collect("auto", 50, 6, out, now=tue) == 0
+        with gzip.open(os.path.join(out, "hl", "2026", "10", _day_files(out, "20261020")[0]), "rt",
+                       encoding="utf-8") as fh:
+            assert json.load(fh)["summary"]["sigma"] is None
+        with open(os.path.join(out, "pillar3_daily.csv"), encoding="utf-8") as fh:
+            assert len(list(csv.DictReader(fh))) == 2
         # σ — только по закрытым дням: свеча, открытая за сутки до снимка, ещё не закрыта
         r40 = [(k * TC.DAY, 1, 1, 100 * math.exp(0.01 * k + 0.02 * (-1) ** k + (0.05 if k == 39 else 0)))
                for k in range(40)]
@@ -1086,7 +1191,9 @@ def selftest() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Стопы BTC на Hyperliquid сейчас")
     sub = ap.add_subparsers(dest="mode", required=True)
-    sub.add_parser("selftest")
+    sub.add_parser("selftest").add_argument("--live", action="store_true",
+                                            help="плюс живые запросы к Hyperliquid и Coinbase")
+    sub.add_parser("sigmacheck", help="σ Binance против Coinbase (облако считает по Coinbase)")
     r = sub.add_parser("run")
     r.add_argument("--top", type=int, default=2000, help="сколько крупнейших счетов; 0 — все")
     r.add_argument("--workers", type=int, default=WORKERS)
@@ -1109,7 +1216,8 @@ def main() -> None:
     dp.add_argument("--top", type=int, default=2000)
     sub.add_parser("lbstats", help="поля и активность счетов в таблице лидеров")
     a = ap.parse_args()
-    if a.mode in ("run", "collect", "sync", "lbstats") and requests is None:
+    if (a.mode in ("run", "collect", "sync", "lbstats", "sigmacheck") or getattr(a, "live", False)) \
+            and requests is None:
         sys.exit("Нужен пакет requests: py -m pip install requests")
     if a.mode == "collect":
         sys.exit(collect(a.kind, a.top, a.workers, a.out, a.force, active=a.active))
@@ -1122,8 +1230,13 @@ def main() -> None:
     if a.mode == "lbstats":
         lbstats()
         return
+    if a.mode == "sigmacheck":
+        sigmacheck()
+        return
     if a.mode == "selftest":
         selftest()
+        if a.live:
+            live_check()
     elif a.mode == "recompute":
         recompute(a.snapshot)
     elif a.mode == "widths":
