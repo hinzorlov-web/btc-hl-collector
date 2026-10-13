@@ -146,14 +146,26 @@ def btc_market() -> tuple[float, float]:
     raise RuntimeError("BTC не найден в metaAndAssetCtxs")
 
 
-def leaderboard() -> list[str]:
-    """Все счета таблицы лидеров, от крупного к мелкому."""
+def leaderboard_rows() -> list[dict]:
+    """Все строки таблицы лидеров, от крупного счёта к мелкому."""
     r = requests.get(LEADERBOARD, timeout=120)
     r.raise_for_status()
     rows = r.json()["leaderboardRows"]
     rows.sort(key=lambda x: float(x.get("accountValue") or 0), reverse=True)
     print(f"Таблица лидеров: {len(rows)} счетов")
-    return [x["ethAddress"] for x in rows]
+    return rows
+
+
+def leaderboard() -> list[str]:
+    return [x["ethAddress"] for x in leaderboard_rows()]
+
+
+def day_volume(row: dict) -> float:
+    """Оборот счёта за окно «day» таблицы лидеров (0, если поля нет)."""
+    for w in row.get("windowPerformances") or []:
+        if isinstance(w, list) and len(w) == 2 and w[0] == "day" and isinstance(w[1], dict):
+            return float(w[1].get("vlm") or 0)
+    return 0.0
 
 
 def known_path() -> str:
@@ -468,10 +480,15 @@ def stamp_ms(stamp: str) -> int:
     return int(datetime.strptime(stamp[:13], "%Y%m%d_%H%M").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def poll(top: int, workers: int, known: bool) -> dict:
-    """Сетевая часть: рынок, таблица лидеров, позиции BTC, HLP. Без расчёта столпа."""
+def poll(top: int, workers: int, known: bool, active: bool = False) -> dict:
+    """
+    Сетевая часть: рынок, таблица лидеров, позиции BTC, HLP. Без расчёта столпа.
+    active — добавить счета с оборотом за сутки > 0 (кто торговал, тот мог
+    открыть позицию; проверка аудитора 13.10: таких 5–10 тыс. из ~47 тыс.).
+    """
     oi, mark = btc_market()
-    full = leaderboard()
+    lb = leaderboard_rows()
+    full = [x["ethAddress"] for x in lb]
     n_top = len(full) if top <= 0 else min(top, len(full))
     picked = list(enumerate(full[:n_top]))
     what, utc_k = f"{n_top} крупнейших", None
@@ -481,11 +498,20 @@ def poll(top: int, workers: int, known: bool) -> dict:
             sys.exit("Нет списка держателей BTC — сначала полный опрос: py btc_hl_stops.py run --top 0")
         extra = [(i, a) for i, a in enumerate(full[n_top:], n_top) if a.lower() in ks]
         picked += extra
-        what += f" + {len(extra)} держателей BTC из полного опроса {utc_k}"
+        what += f" + {len(extra)} держателей BTC (список от {utc_k})"
+    n_active = None
+    if active:
+        act = {x["ethAddress"].lower() for x in lb if day_volume(x) > 0}
+        n_active = len(act)
+        chosen = {a.lower() for _, a in picked}
+        extra2 = [(i, a) for i, a in enumerate(full[n_top:], n_top) if a.lower() in act and a.lower() not in chosen]
+        picked = sorted(picked + extra2)
+        what += f" + {len(extra2)} торговавших за сутки (всего торговавших {n_active})"
     addrs = [a for _, a in picked]
     print(f"Опрашиваю {len(addrs)} счетов ({what}); ≈ {len(addrs) / MAX_PER_MIN:.0f} мин")
     step = max(250, len(addrs) // 20)
     positions, errors, first_err, t0, done = [], 0, None, time.time(), 0
+    no_pos = set()
     t_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for rank, a, p, err in ex.map(fetch_one, picked):
@@ -493,7 +519,9 @@ def poll(top: int, workers: int, known: bool) -> dict:
             if err:
                 errors += 1
                 first_err = first_err or err
-            elif p:
+            elif not p:
+                no_pos.add(a.lower())
+            else:
                 p["addr"], p["rank"] = a, rank
                 positions.append(p)
             if done % step == 0:
@@ -507,7 +535,7 @@ def poll(top: int, workers: int, known: bool) -> dict:
     t_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"oi": oi, "mark": mark, "full": full, "n_top": n_top, "addrs": addrs, "utc_k": utc_k,
             "positions": positions, "hlp": hlp, "errors": errors, "minutes": minutes,
-            "t_start": t_start, "t_end": t_end}
+            "t_start": t_start, "t_end": t_end, "no_pos": no_pos, "n_active": n_active}
 
 
 def run(top: int, workers: int, known: bool = False) -> None:
@@ -551,26 +579,47 @@ def _day_files(out: str, day: str) -> list[str]:
     return sorted(f for f in os.listdir(d) if f.startswith(f"hl_{day}_")) if os.path.isdir(d) else []
 
 
-def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None) -> int:
+LOG_COLS = ["utc", "kind", "polled", "positions", "errors", "minutes", "cover_long", "cover_short",
+            "oi_btc", "mark", "active", "known", "t_start", "t_end"]
+
+
+def _append_log(path: str, row: dict) -> None:
+    """Журнал сбора; старый заголовок дополняется новыми колонками без потери строк."""
+    rows = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    rows.append(row)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=LOG_COLS, restval="")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in LOG_COLS})
+
+
+def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
+            active: bool = True) -> int:
     """
     Только сбор, без расчёта столпа (σ берётся с Binance, а Binance серверам
     GitHub отказывает): позиции BTC, открытый интерес, цена, HLP.
-    auto: по воскресеньям (UTC), без списка держателей или если ему больше
-    8 суток — полный опрос; иначе ежедневный (топ N + держатели).
+    auto: по воскресеньям (UTC), без списка держателей или если полному опросу
+    больше 8 суток — полный опрос; иначе ежедневный: топ N + держатели BTC +
+    (active) торговавшие за сутки. Список держателей обновляется каждый раз:
+    кто опрошен без позиции BTC — выбывает, у кого позиция нашлась — входит.
     Второй запуск за те же сутки пропускается (ежедневный — если снимок за
     сутки уже есть; полный — если уже есть полный).
     """
     global KNOWN_FILE
     now = now or datetime.now(timezone.utc)
     KNOWN_FILE = os.path.join(out, "hl_known.json")
-    utc_k, ks = None, set()
+    utc_k, ks, full_utc = None, set(), None
     if os.path.isfile(KNOWN_FILE):
         with open(KNOWN_FILE, encoding="utf-8") as fh:
             k = json.load(fh)
-        utc_k, ks = k["utc"], set(k["addresses"])
+        utc_k, ks, full_utc = k["utc"], set(k["addresses"]), k.get("full_utc", k["utc"])
     if mode == "auto":
-        stale = utc_k is None or (now - datetime.strptime(utc_k[:13], "%Y%m%d_%H%M")
-                                  .replace(tzinfo=timezone.utc)).days >= 8
+        stale = full_utc is None or (now - datetime.strptime(full_utc[:13], "%Y%m%d_%H%M")
+                                     .replace(tzinfo=timezone.utc)).days >= 8
         mode = "full" if (now.weekday() == 6 or not ks or stale) else "daily"
     if mode == "daily" and not ks:
         print("Списка держателей нет — делаю полный опрос")
@@ -581,7 +630,7 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
         print(f"Снимок за {day} ({mode}) уже есть: {have[-1]} — пропускаю")
         return 0
     print(f"Сбор Hyperliquid: режим {mode}, {now:%Y-%m-%d %H:%M} UTC")
-    P = poll(top if mode == "daily" else 0, workers, mode == "daily")
+    P = poll(top if mode == "daily" else 0, workers, mode == "daily", active and mode == "daily")
     pos, n = P["positions"], len(P["addrs"])
     if not pos or P["errors"] > n / 2:
         print(f"[!] Сбор не удался: позиций {len(pos)}, без ответа {P['errors']} из {n} — снимок не сохранён")
@@ -597,19 +646,21 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
     with gzip.open(path, "wt", encoding="utf-8") as fh:
         json.dump({"utc": stamp, "kind": mode, "top": P["n_top"], "polled": n, "leaderboard": len(P["full"]),
                    "known_from": P["utc_k"], "hlp": [a for a, _, _ in P["hlp"]], "errors": P["errors"],
-                   "t_start": P["t_start"], "t_end": P["t_end"],
+                   "t_start": P["t_start"], "t_end": P["t_end"], "active": P["n_active"],
                    "minutes": round(P["minutes"], 1), "summary": summary, "positions": pos}, fh)
+    found = {p["addr"].lower() for p in pos if p["rank"] >= 0}
     if mode == "full":
-        save_known([p for p in pos if p["rank"] >= 0], stamp)
-    log = os.path.join(out, "hl_log.csv")
-    new = not os.path.isfile(log)
-    with open(log, "a", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        if new:
-            w.writerow(["utc", "kind", "polled", "positions", "errors", "minutes",
-                        "cover_long", "cover_short", "oi_btc", "mark"])
-        w.writerow([stamp, mode, n, len(pos), P["errors"], f"{P['minutes']:.1f}",
-                    f"{L / P['oi']:.4f}", f"{S / P['oi']:.4f}", f"{P['oi']:.2f}", f"{P['mark']:.1f}"])
+        new_known, full_utc = found, stamp
+    else:
+        new_known = (ks - P["no_pos"]) | found
+    with open(KNOWN_FILE, "w", encoding="utf-8") as fh:
+        json.dump({"utc": stamp, "full_utc": full_utc, "addresses": sorted(new_known)}, fh)
+    _append_log(os.path.join(out, "hl_log.csv"), {
+        "utc": stamp, "kind": mode, "polled": n, "positions": len(pos), "errors": P["errors"],
+        "minutes": f"{P['minutes']:.1f}", "cover_long": f"{L / P['oi']:.4f}",
+        "cover_short": f"{S / P['oi']:.4f}", "oi_btc": f"{P['oi']:.2f}", "mark": f"{P['mark']:.1f}",
+        "active": "" if P["n_active"] is None else P["n_active"], "known": len(new_known),
+        "t_start": P["t_start"], "t_end": P["t_end"]})
     print(f"Снимок: {os.path.relpath(path, out)}; позиций {len(pos)}; покрытие лонги "
           f"{100 * L / P['oi']:.0f}%, шорты {100 * S / P['oi']:.0f}%")
     return 0
@@ -847,7 +898,7 @@ def selftest() -> None:
     import shutil
     import tempfile
     g = globals()
-    saved = {k: g[k] for k in ("HERE", "SNAP_DIR", "post", "btc_market", "leaderboard", "requests",
+    saved = {k: g[k] for k in ("HERE", "SNAP_DIR", "post", "btc_market", "leaderboard_rows", "requests",
                                "LIMIT", "CUTS", "HLP_VAULT", "KNOWN_FILE", "_gh_tree", "_gh_raw")}
     saved_load = TC.load
     tmp = tempfile.mkdtemp(prefix="hl_selftest_")
@@ -884,7 +935,9 @@ def selftest() -> None:
                 raise RuntimeError("тест: нет ответа")
             return book.get(u) or extra[u]
         g.update(HERE=tmp, SNAP_DIR=os.path.join(tmp, "snap"), post=fake_post,
-                 btc_market=lambda: (500.0, 84000.0), leaderboard=lambda: lead,
+                 btc_market=lambda: (500.0, 84000.0),
+                 leaderboard_rows=lambda: [{"ethAddress": a, "windowPerformances": [
+                     ["day", {"vlm": "100" if i % 7 == 3 else "0"}]]} for i, a in enumerate(lead)],
                  requests=saved["requests"] or object(), LIMIT=Limiter(60000), CUTS=(100, 200),
                  HLP_VAULT=parent)
         rows = [(k * TC.DAY, 84000.0, 84000.0, 84000.0 * math.exp(0.02 * (-1) ** k)) for k in range(60)]
@@ -937,6 +990,10 @@ def selftest() -> None:
         sun = datetime(2026, 10, 18, 0, 10, tzinfo=timezone.utc)
         mon = datetime(2026, 10, 19, 0, 10, tzinfo=timezone.utc)
         assert sun.weekday() == 6
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "hl_log.csv"), "w", encoding="utf-8", newline="") as fh:
+            fh.write("utc,kind,polled,positions,errors,minutes,cover_long,cover_short,oi_btc,mark\n"
+                     "20261013_1022,full,47000,3200,0,95.0,0.4,0.4,37000,83000\n")
         print("\n--- облачный сборщик: воскресенье ---")
         assert collect("auto", 50, 6, out, now=sun) == 0
         f_sun = _day_files(out, "20261018")
@@ -950,9 +1007,18 @@ def selftest() -> None:
         assert collect("daily", 50, 6, out, now=mon) == 0 and len(_day_files(out, "20261019")) == 1
         with gzip.open(os.path.join(out, "hl", "2026", "10", f_mon[0]), "rt", encoding="utf-8") as fh:
             dm = json.load(fh)
-        assert dm["kind"] == "daily" and dm["polled"] == 50 + sum(1 for a in lead[50:] if a.lower() in holders)
+        active_set = {a.lower() for i, a in enumerate(lead) if i % 7 == 3}
+        expect = 50 + sum(1 for a in lead[50:] if a.lower() in holders or a.lower() in active_set)
+        assert dm["kind"] == "daily" and dm["polled"] == expect, (dm["polled"], expect)
+        assert dm["active"] == len(active_set)
         with open(os.path.join(out, "hl_log.csv"), encoding="utf-8") as fh:
-            assert len(list(csv.reader(fh))) == 3                          # заголовок + 2 снимка
+            lg = list(csv.DictReader(fh))
+        assert len(lg) == 3 and lg[0]["utc"] == "20261013_1022" and lg[0]["active"] == ""   # старая строка цела
+        assert lg[2]["kind"] == "daily" and lg[2]["active"] == str(len(active_set))
+        with open(os.path.join(out, "hl_known.json"), encoding="utf-8") as fh:
+            kn = json.load(fh)
+        assert kn["utc"] == "20261019_0010" and kn["full_utc"] == "20261018_0010"
+        assert set(kn["addresses"]) == {p["addr"].lower() for p in dm["positions"] if p["rank"] >= 0}
         # «Ноутбук»: забрать снимки из «облака» и посчитать столп по последнему
         tree = {"tree": [{"type": "blob",
                           "path": os.path.relpath(os.path.join(dp, f), tmp).replace(os.sep, "/")}
@@ -963,7 +1029,7 @@ def selftest() -> None:
         sync()
         assert sorted(os.listdir(os.path.join(tmp, "laptop"))) == sorted(f_sun + f_mon)
         with open(os.path.join(tmp, "hl_known.json"), encoding="utf-8") as fh:
-            assert json.load(fh)["utc"] == "20261018_0010"
+            assert json.load(fh)["utc"] == "20261019_0010"                  # список обновляется ежедневно
         sync()                                                              # повтор — ничего нового
         snap_m, s0, _ = _load_snap("latest")
         assert snap_m["kind"] == "daily" and s0["sigma"] is not None
@@ -976,7 +1042,7 @@ def selftest() -> None:
         sync()
         assert os.path.isfile(os.path.join(tmp, "hl_known_20261011_2209.json"))
         with open(os.path.join(tmp, "hl_known.json"), encoding="utf-8") as fh:
-            assert json.load(fh)["utc"] == "20261018_0010"
+            assert json.load(fh)["utc"] == "20261019_0010"
         print("\n--- проверка глубины: полный снимок против топ 50 + прежних держателей ---")
         depth(os.path.join(tmp, "laptop", f_sun[0]), "auto", top=50)
         # Таблица лидеров: есть ли активность по счетам
@@ -1034,6 +1100,8 @@ def main() -> None:
     c.add_argument("--workers", type=int, default=WORKERS)
     c.add_argument("--out", default=DATA_DIR)
     c.add_argument("--force", action="store_true")
+    c.add_argument("--no-active", dest="active", action="store_false",
+                   help="не добавлять торговавших за сутки")
     sub.add_parser("sync", help="забрать снимки облачного сборщика на ноутбук")
     dp = sub.add_parser("depth", help="проверка глубины ежедневного опроса (аудитор, 13.10)")
     dp.add_argument("snapshot", nargs="?", default="latest")
@@ -1044,7 +1112,7 @@ def main() -> None:
     if a.mode in ("run", "collect", "sync", "lbstats") and requests is None:
         sys.exit("Нужен пакет requests: py -m pip install requests")
     if a.mode == "collect":
-        sys.exit(collect(a.kind, a.top, a.workers, a.out, a.force))
+        sys.exit(collect(a.kind, a.top, a.workers, a.out, a.force, active=a.active))
     if a.mode == "sync":
         sync()
         return
