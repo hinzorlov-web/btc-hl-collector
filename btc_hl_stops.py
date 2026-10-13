@@ -545,7 +545,7 @@ def poll(top: int, workers: int, known: bool, active: bool = False) -> dict:
         extra = [(i, a) for i, a in enumerate(full[n_top:], n_top) if a.lower() in ks]
         picked += extra
         what += f" + {len(extra)} держателей BTC (список от {utc_k})"
-    n_active = None
+    n_active, act = None, None
     if active:
         act = {x["ethAddress"].lower() for x in lb if day_volume(x) > 0}
         n_active = len(act)
@@ -581,7 +581,7 @@ def poll(top: int, workers: int, known: bool, active: bool = False) -> dict:
     t_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"oi": oi, "mark": mark, "full": full, "n_top": n_top, "addrs": addrs, "utc_k": utc_k,
             "positions": positions, "hlp": hlp, "errors": errors, "minutes": minutes,
-            "t_start": t_start, "t_end": t_end, "no_pos": no_pos, "n_active": n_active}
+            "t_start": t_start, "t_end": t_end, "no_pos": no_pos, "n_active": n_active, "act": act}
 
 
 def run(top: int, workers: int, known: bool = False) -> None:
@@ -697,7 +697,7 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
         print(f"Снимок за {day} ({mode}) уже есть: {have[-1]} — пропускаю")
         return 0
     print(f"Сбор Hyperliquid: режим {mode}, {now:%Y-%m-%d %H:%M} UTC")
-    P = poll(top if mode == "daily" else 0, workers, mode == "daily", active and mode == "daily")
+    P = poll(top if mode == "daily" else 0, workers, mode == "daily", active)
     pos, n = P["positions"], len(P["addrs"])
     if not pos or P["errors"] > n / 2:
         print(f"[!] Сбор не удался: позиций {len(pos)}, без ответа {P['errors']} из {n} — снимок не сохранён")
@@ -718,6 +718,14 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
             sig_src = summary["sigma_src"] = "coinbase"
     except Exception as exc:                              # noqa: BLE001
         print(f"[!] Столп 3 в облаке не посчитан ({str(exc)[:80]}) — посчитает ноутбук")
+    daily_from = None
+    if mode == "full":
+        # Пометка «попал бы в ежедневный опрос» (топ N + список держателей + торговавшие
+        # за сутки) — тот же момент, что и эталон: проверка глубины без разницы во времени
+        dset = {a.lower() for a in P["full"][:top]} | ks | (P["act"] or set())
+        for p in pos:
+            p["daily"] = p["rank"] < 0 or p["addr"].lower() in dset
+        daily_from = utc_k
     d = os.path.join(out, "hl", day[:4], day[4:6])
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"hl_{stamp}_{mode}.json.gz")
@@ -725,7 +733,8 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
         json.dump({"utc": stamp, "kind": mode, "top": P["n_top"], "polled": n, "leaderboard": len(P["full"]),
                    "known_from": P["utc_k"], "hlp": [a for a, _, _ in P["hlp"]], "errors": P["errors"],
                    "t_start": P["t_start"], "t_end": P["t_end"], "active": P["n_active"],
-                   "minutes": round(P["minutes"], 1), "summary": summary, "positions": pos}, fh)
+                   "minutes": round(P["minutes"], 1), "daily_top": top if mode == "full" else None,
+                   "daily_known_from": daily_from, "summary": summary, "positions": pos}, fh)
     found = {p["addr"].lower() for p in pos if p["rank"] >= 0}
     if mode == "full":
         new_known, full_utc = found, stamp
@@ -811,27 +820,36 @@ def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> tuple:
     snap, s0, curve = _load_snap(snap_path)
     if not _is_full(snap):
         print(f"[!] Снимок {snap['utc']} — не полный опрос; эталон из него неполный")
+    pos = [p for p in snap["positions"] if p.get("rank", 0) >= 0]
+    flagged = any("daily" in p for p in pos)
     if known_path_arg == "auto":
         cands = [(f[9:22], os.path.join(HERE, f)) for f in os.listdir(HERE)
                  if f.startswith("hl_known_") and f.endswith(".json") and f[9:22] < snap["utc"]]
         cands += [(u, p) for u, _, p in _full_snapshots(before=snap["utc"])]
-        if not cands:
+        if not cands and not flagged:
             sys.exit("Нет более раннего списка держателей: ни hl_known_ГГГГММДД_ЧЧММ.json, "
                      "ни более раннего полного снимка в hl_snapshots/")
-        known_path_arg = max(cands)[1]
-    k = _read_snap(known_path_arg)
-    if "addresses" in k:
-        ks, src = set(k["addresses"]), "список"
-    else:
-        ks, src = {p["addr"].lower() for p in k["positions"] if p.get("rank", 0) >= 0}, "полный снимок"
-    print(f"Держатели: {src} {os.path.basename(known_path_arg)}")
-    pos = [p for p in snap["positions"] if p.get("rank", 0) >= 0]
-    sets = [("эталон: все счета", pos),
-            (f"топ {top} + держатели от {k['utc']}", [p for p in pos if p["rank"] < top or p["addr"].lower() in ks]),
-            (f"топ {top}", [p for p in pos if p["rank"] < top])]
-    print(f"ПРОВЕРКА ГЛУБИНЫ — снимок {snap['utc']} ({snap.get('kind') or 'полный'}), держатели от {k['utc']} "
-          f"({len(ks)} счетов)\n")
-    print(f"   {'выборка':<34}{'позиций':>8}{'покр. Л/Ш':>11}{'шорты: зона':>13}{'лонги: зона':>13}"
+        known_path_arg = max(cands)[1] if cands else None
+    sets = [("эталон: все счета", pos)]
+    if flagged:                              # облачный полный снимок с пометкой ежедневного состава
+        sets.append((f"ежедневный состав (топ {snap.get('daily_top')} + список + торговавшие)",
+                     [p for p in pos if p.get("daily")]))
+    head = f"ПРОВЕРКА ГЛУБИНЫ — снимок {snap['utc']} ({snap.get('kind') or 'полный'})"
+    if flagged:
+        head += f"; список держателей ежедневного состава — от {snap.get('daily_known_from') or '—'}"
+    if known_path_arg:
+        k = _read_snap(known_path_arg)
+        if "addresses" in k:
+            ks, src = set(k["addresses"]), "список"
+        else:
+            ks, src = {p["addr"].lower() for p in k["positions"] if p.get("rank", 0) >= 0}, "полный снимок"
+        print(f"Прежние держатели: {src} {os.path.basename(known_path_arg)}")
+        sets.append((f"топ {top} + держатели от {k['utc']}",
+                     [p for p in pos if p["rank"] < top or p["addr"].lower() in ks]))
+        head += f"; прежние держатели от {k['utc']} ({len(ks)} счетов)"
+    sets.append((f"топ {top}", [p for p in pos if p["rank"] < top]))
+    print(head + "\n")
+    print(f"   {'выборка':<56}{'позиций':>8}{'покр. Л/Ш':>11}{'шорты: зона':>13}{'лонги: зона':>13}"
           f"{'столп 3':>8}{'в 2/5/10%, $ млн: шорты | лонги':>36}{'кум. 1/2/4σ':>16}")
     for name, sub in sets:
         z = summarize(sub, s0["oi_btc"], s0["mark"], s0["sigma"], curve, sens=False)
@@ -840,9 +858,9 @@ def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> tuple:
         cum = "/".join("—" if z["cum"][str(kk)]["value"] is None else f"{z['cum'][str(kk)]['value']:+.0f}"
                        for kk in CUM_K)
         p3 = "—" if z["pillar3"] is None else f"{z['pillar3']:+.1f}"
-        print(f"   {name:<34}{len(sub):>8}{100 * z['cover_long']:>6.0f}/{100 * z['cover_short']:<4.0f}"
+        print(f"   {name:<56}{len(sub):>8}{100 * z['cover_long']:>6.0f}/{100 * z['cover_short']:<4.0f}"
               f"{zs(z['short']):>13}{zs(z['long']):>13}{p3:>8}{near('short') + ' | ' + near('long'):>36}{cum:>16}")
-    print("\n   Если вторая строка совпадает с первой — ежедневный состав годен как есть.")
+    print("\n   Строки ниже эталона сравниваются с ним: совпадают — состав годен.")
     return snap_path, known_path_arg
 
 
@@ -1130,6 +1148,14 @@ def selftest() -> None:
         assert collect("auto", 50, 6, out, now=sun) == 0
         f_sun = _day_files(out, "20261018")
         assert len(f_sun) == 1 and f_sun[0].endswith("_full.json.gz"), f_sun
+        # Полный опрос помечает, кто попал бы в ежедневный: топ 50 + список (его ещё нет) + торговавшие
+        with gzip.open(os.path.join(out, "hl", "2026", "10", f_sun[0]), "rt", encoding="utf-8") as fh:
+            ds = json.load(fh)
+        act7 = {a.lower() for i, a in enumerate(lead) if i % 7 == 3}
+        assert ds["daily_top"] == 50 and ds["active"] == len(act7)
+        assert all(p["daily"] == (p["rank"] < 50 or p["addr"].lower() in act7) for p in ds["positions"]
+                   if p["rank"] >= 0)
+        assert 0 < sum(p["daily"] for p in ds["positions"]) < len(ds["positions"])
         assert os.path.isfile(os.path.join(out, "hl_known.json"))
         assert collect("auto", 50, 6, out, now=sun) == 0 and len(_day_files(out, "20261018")) == 1
         print("\n--- облачный сборщик: понедельник ---")
@@ -1199,6 +1225,8 @@ def selftest() -> None:
         os.remove(os.path.join(tmp, "laptop", "hl_20261011_2209.json"))
         os.remove(os.path.join(tmp, "laptop", "hl_20261012_1500.json"))
         g["FULL_MIN"] = 20000
+        print("\n--- проверка глубины: только пометка ежедневного состава ---")
+        assert depth(os.path.join(tmp, "laptop", f_sun[0]), "auto", top=50)[1] is None
         # Таблица лидеров: есть ли активность по счетам
         class _R:
             def raise_for_status(self):
@@ -1245,7 +1273,8 @@ def selftest() -> None:
     print("\nselftest: OK — разбор позиции, покрытие, скользящее окно (сетка ошиблась бы), равенство, "
           "хрупкость, вариант B, ограничитель, параллельный прогон, HLP, снимок, пересчёт, ширины, "
           "облачный сборщик (полный/ежедневный/повтор), забор на ноутбук, σ по закрытым дням, "
-          "кумулятивная версия, проверка глубины (список или ранний полный снимок), активность таблицы лидеров, "
+          "кумулятивная версия, проверка глубины (список, ранний полный снимок, пометка ежедневного состава), "
+          "активность таблицы лидеров, "
           "ежедневный режим с известными держателями")
 
 
