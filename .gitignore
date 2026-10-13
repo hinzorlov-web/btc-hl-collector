@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+hl_snapshots/
+p3_daily_full.json
+p3_touch_curve.csv

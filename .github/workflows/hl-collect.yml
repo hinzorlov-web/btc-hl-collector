@@ -1,0 +1,59 @@
+# Ежедневный снимок стопов BTC на Hyperliquid (шаг 2а проекта).
+# Будит Supabase в 00:10 UTC (repository_dispatch, тип hl_collect).
+# Резерв — собственное расписание GitHub в 00:40 UTC: если снимок за сутки
+# уже есть, сборщик сам пропускает повтор. По воскресеньям — полный опрос.
+name: hl-collect
+
+on:
+  repository_dispatch:
+    types: [hl_collect]
+  schedule:
+    - cron: "40 0 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto — сам выбирает; daily — топ 2000 + держатели; full — все счета"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, daily, full]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hl-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install requests
+
+      - name: Collect
+        env:
+          MODE: ${{ github.event.inputs.mode || github.event.client_payload.mode || 'auto' }}
+        run: python btc_hl_stops.py collect --mode "$MODE"
+
+      - name: Save
+        if: always()
+        run: |
+          git config user.name "hl-collector"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then echo "Нечего сохранять"; exit 0; fi
+          git commit -m "HL снимок $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push && exit 0
+            sleep 5
+          done
+          exit 1

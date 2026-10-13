@@ -1,0 +1,922 @@
+"""
+btc_hl_stops.py — где стоят стопы BTC сейчас: Hyperliquid, бесплатно.
+Столп 3 индекса, метрика «7 дней». PROJECT.md 6.15, 6.18, 6.19.
+
+Как: у Hyperliquid нет запроса «все позиции сразу». Поэтому:
+  1. список счетов — публичная таблица лидеров (stats-data.hyperliquid.xyz,
+     ~47 тыс. счетов, кто согласился быть в списке);
+  2. берём N крупнейших по размеру счёта (--top 0 — все);
+  3. по каждому — официальный запрос clearinghouseState: размер позиции BTC,
+     цена входа, ЦЕНА ЛИКВИДАЦИИ (её считает сама биржа), плечо;
+  4. хранилище HLP (главный контрагент площадки) — родитель и дочерние
+     хранилища, в каждом прогоне;
+  5. сверяем сумму найденных позиций с общим открытым интересом BTC на
+     бирже — это ПОКРЫТИЕ: какую долю рынка Hyperliquid мы видим.
+Лимит биржи: 1200 «весов» в минуту, запрос по счёту — вес 2. Запросы идут
+параллельно (6 потоков), по открытому соединению, не больше 500 в минуту:
+2000 счетов — 4 мин (11.10), все ~47 тыс. — около 95 мин.
+
+Столп 3 («7 дней», принят аудитором 11.10): самая плотная зона стопов сверху
+(шорты) и снизу (лонги), расстояние в дневных ходах, вероятность дойти за
+7 дней по кривой p3_touch_curve.csv. Столп 3 = P(вверх) − P(вниз), −100…+100.
+
+ЗОНА (с 12.10, правило записано до прогона): скользящее окно шириной 0,5 п.п.
+расстояния вместо фиксированной сетки 0,5% — сетка резала скопление по
+границе корзины (ошибка №58). Окно перебирается по позициям в пределах
+8 дневных ходов, берётся максимум суммы размеров; при равенстве — ближнее
+к цене; расстояние зоны — среднее расстояние её позиций, взвешенное размером.
+
+Справочно, не условие: столп 3 без крупнейшего счёта каждой зоны (хрупкость)
+и вариант B «ожидаемый вынос за 7 дней» (отведён 11.10, не развивается).
+
+Каждый прогон сохраняется в hl_snapshots/ — так копится собственная история.
+
+Режимы:
+  py btc_hl_stops.py selftest
+  py btc_hl_stops.py run --top 2000 --known      — ежедневно: топ 2000 + держатели BTC
+                                                     из последнего полного опроса (≈ 10 мин)
+  py btc_hl_stops.py run --top 0                  — раз в неделю: все счета (≈ 95 мин),
+                                                     обновляет список держателей hl_known.json
+  py btc_hl_stops.py recompute hl_snapshots/hl_ГГГГММДД_ЧЧММ.json   — пересчёт без опроса
+  py btc_hl_stops.py widths hl_snapshots/hl_ГГГГММДД_ЧЧММ.json      — ширина окна 0,5/1/2%
+  py btc_hl_stops.py sync                         — забрать снимки облачного сборщика
+  py btc_hl_stops.py recompute latest             — столп 3 по последнему снимку
+  python btc_hl_stops.py collect [--mode auto]    — облачный сборщик (GitHub Actions), без расчёта
+
+Облачный сборщик (шаг 2а, репозиторий hinzorlov-web/btc-hl-collector): Supabase
+каждый день будит GitHub Actions, тот запускает collect и складывает сжатые
+снимки в data/hl/ГГГГ/ММ/. σ (Binance) в облаке не считается — столп 3
+считается на ноутбуке по снимку (recompute). σ — по дням, закрытым к моменту
+снимка.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import json
+import math
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import btc_touch_curve as TC                                    # noqa: E402
+import btc_magnet_test as MT                                    # noqa: E402
+
+try:
+    import requests
+except ImportError:                                          # pragma: no cover
+    requests = None
+
+INFO = "https://api.hyperliquid.xyz/info"
+LEADERBOARD = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+HLP_VAULT = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"   # Hyperliquidity Provider (HLP)
+SNAP_DIR = os.path.join(HERE, "hl_snapshots")
+WIN_PCT = 0.5              # ширина окна зоны, п.п. расстояния
+WIDTHS = (0.5, 1.0, 2.0)   # проверка чувствительности — один раз, для записи
+MAX_PER_MIN = 500          # вес запроса 2 → 1000 из 1200 разрешённых в минуту
+WORKERS = 6                # параллельных запросов: задержка сети ~1,3 с на запрос
+CUTS = (500, 1000, 2000, 5000, 10000, 20000)
+B_NOTE = "справочно; отведён 11.10 — сдвиг с глубиной выборки дали отдельные счета (№57)"
+REPO = "hinzorlov-web/btc-hl-collector"   # облачный сборщик (GitHub Actions), шаг 2а
+DATA_DIR = os.path.join(HERE, "data")       # куда пишет сборщик в репозитории
+KNOWN_FILE = None                           # путь к hl_known.json (сборщик задаёт свой)
+
+
+class Limiter:
+    """Общий для всех потоков интервал между стартами запросов."""
+    def __init__(self, per_min: int):
+        self.gap = 60.0 / per_min
+        self.next = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next)
+            self.next = start + self.gap
+        time.sleep(max(0.0, start - now))
+
+
+LIMIT = Limiter(MAX_PER_MIN)
+_TL = threading.local()
+
+
+def session():
+    """Своё соединение у каждого потока — без нового рукопожатия на каждый запрос."""
+    s = getattr(_TL, "s", None)
+    if s is None:
+        s = _TL.s = requests.Session()
+    return s
+
+
+# --------------------------------------------------------------------------
+# Сеть
+# --------------------------------------------------------------------------
+
+def post(body: dict, tries: int = 5):
+    for k in range(tries):
+        LIMIT.wait()
+        try:
+            r = session().post(INFO, json=body, timeout=30)
+            if r.status_code == 429:
+                time.sleep(5 * (k + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException:
+            if k == tries - 1:
+                raise
+            time.sleep(2 * (k + 1))
+    raise RuntimeError("биржа не ответила")
+
+
+def btc_market() -> tuple[float, float]:
+    """Открытый интерес BTC (в монетах) и цена отметки."""
+    meta, ctxs = post({"type": "metaAndAssetCtxs"})
+    for a, c in zip(meta["universe"], ctxs):
+        if a["name"] == "BTC":
+            return float(c["openInterest"]), float(c["markPx"])
+    raise RuntimeError("BTC не найден в metaAndAssetCtxs")
+
+
+def leaderboard() -> list[str]:
+    """Все счета таблицы лидеров, от крупного к мелкому."""
+    r = requests.get(LEADERBOARD, timeout=120)
+    r.raise_for_status()
+    rows = r.json()["leaderboardRows"]
+    rows.sort(key=lambda x: float(x.get("accountValue") or 0), reverse=True)
+    print(f"Таблица лидеров: {len(rows)} счетов")
+    return [x["ethAddress"] for x in rows]
+
+
+def known_path() -> str:
+    return KNOWN_FILE or os.path.join(HERE, "hl_known.json")
+
+
+def save_known(positions: list, utc: str) -> None:
+    with open(known_path(), "w", encoding="utf-8") as fh:
+        json.dump({"utc": utc, "addresses": sorted({p["addr"].lower() for p in positions})}, fh)
+
+
+def load_known() -> tuple:
+    """Держатели BTC из последнего полного опроса: hl_known.json, а если его
+    нет — снимок с наибольшим охватом (не меньше 20 000 счетов)."""
+    if os.path.isfile(known_path()):
+        with open(known_path(), encoding="utf-8") as fh:
+            k = json.load(fh)
+        return k["utc"], set(k["addresses"])
+    best = None
+    if os.path.isdir(SNAP_DIR):
+        for fn in sorted(os.listdir(SNAP_DIR)):
+            if fn.startswith("hl_") and fn.endswith(".json"):
+                with open(os.path.join(SNAP_DIR, fn), encoding="utf-8") as fh:
+                    snap = json.load(fh)
+                t = snap.get("leaderboard") or snap.get("top") or 0
+                if t >= 20000 and snap.get("top", 0) >= t and (best is None or snap["utc"] > best["utc"]):
+                    best = snap
+    if best:
+        return best["utc"], {p["addr"].lower() for p in best["positions"] if p.get("rank", 0) >= 0}
+    return None, set()
+
+
+def hlp_addresses() -> list[str]:
+    """Хранилище HLP: родитель и дочерние хранилища (позиции держат дочерние)."""
+    d = post({"type": "vaultDetails", "vaultAddress": HLP_VAULT}) or {}
+    rel = d.get("relationship") or {}
+    kids = (rel.get("data") or {}).get("childAddresses") or []
+    return [HLP_VAULT] + [k for k in kids if k.lower() != HLP_VAULT]
+
+
+# --------------------------------------------------------------------------
+# Разбор
+# --------------------------------------------------------------------------
+
+def btc_position(state: dict) -> dict | None:
+    for ap in state.get("assetPositions", []):
+        p = ap.get("position", {})
+        if p.get("coin") == "BTC" and float(p.get("szi") or 0) != 0:
+            lev = p.get("leverage") or {}
+            liq = p.get("liquidationPx")
+            return {"szi": float(p["szi"]), "entry": float(p["entryPx"]),
+                    "liq": float(liq) if liq not in (None, "", "null") else None,
+                    "lev_type": lev.get("type"), "lev": lev.get("value"),
+                    "value": float(p.get("positionValue") or 0)}
+    return None
+
+
+def _k(d_pct: float, sigma: float) -> float:
+    """Расстояние в дневных ходах по расстоянию в процентах (вверх и вниз)."""
+    return abs(math.log(1 + d_pct / 100.0)) / sigma
+
+
+def densest_window(rows: list, up: bool, sigma: float, width: float = WIN_PCT) -> dict | None:
+    """
+    Скользящее окно шириной width п.п. расстояния: максимум суммы размеров
+    среди позиций своей стороны в пределах K_MAX дневных ходов.
+    rows — (dist_pct, size_usd, idx). При равенстве сумм — ближнее к цене.
+    """
+    side = sorted((abs(d), s, i) for d, s, i in rows
+                  if (d > 0) == up and d != 0 and _k(d, sigma) <= MT.K_MAX)
+    if not side:
+        return None
+    total = sum(s for _, s, _ in side)
+    best, run, j = None, 0.0, 0
+    for i in range(len(side)):
+        while j < len(side) and side[j][0] <= side[i][0] + width + 1e-9:
+            run += side[j][1]
+            j += 1
+        if best is None or run > best[0] * (1 + 1e-12):
+            best = (run, i, j)
+        run -= side[i][1]
+    size, i0, j0 = best
+    mem = side[i0:j0]
+    a = sum(x * s for x, s, _ in mem) / size
+    dist = a if up else -a
+    top = max(mem, key=lambda m: m[1])
+    return {"dist_pct": dist, "lo_pct": mem[0][0] if up else -mem[0][0],
+            "hi_pct": mem[-1][0] if up else -mem[-1][0], "size_usd": size,
+            "k": _k(dist, sigma), "share": size / total, "n_acc": len(mem),
+            "top_share": top[1] / size, "_top": top[2], "n_reach": len(side)}
+
+
+def summarize(positions: list[dict], oi: float, mark: float, sigma: float,
+              curve: dict, sens: bool = True, width: float = WIN_PCT) -> dict:
+    longs = [p for p in positions if p["szi"] > 0]
+    shorts = [p for p in positions if p["szi"] < 0]
+    L, S = sum(p["szi"] for p in longs), -sum(p["szi"] for p in shorts)
+    no_liq = {True: 0.0, False: 0.0}
+    for p in positions:
+        if p["liq"] is None or p["liq"] <= 0:
+            no_liq[p["szi"] > 0] += abs(p["szi"]) * mark
+    with_liq = [p for p in positions if p["liq"] is not None and p["liq"] > 0]
+    rows = [(100.0 * (p["liq"] / mark - 1.0), abs(p["szi"]) * mark, i) for i, p in enumerate(with_liq)]
+    out = {"oi_btc": oi, "mark": mark, "sigma": sigma, "n_pos": len(positions),
+           "long_btc": L, "short_btc": S, "width_pct": width,
+           "cover_long": L / oi if oi else None, "cover_short": S / oi if oi else None,
+           "no_liq_long_usd": no_liq[True], "no_liq_short_usd": no_liq[False]}
+    for up, side in ((True, "short"), (False, "long")):
+        z = densest_window(rows, up, sigma, width)
+        if z is not None:
+            z["p7"] = MT.interp(curve["k"], curve[up], z["k"])
+            z["near"] = {th: sum(s for d, s, _ in rows if (d > 0) == up and abs(d) <= th)
+                         for th in (2, 5, 10)}
+        out[side] = z
+    if out["short"] and out["long"]:
+        out["pillar3"] = 100.0 * (out["short"]["p7"] - out["long"]["p7"])
+    else:
+        out["pillar3"] = None
+    # Хрупкость (справка, не условие — решение аудитора 11.10): столп 3, если
+    # исчезнет крупнейший счёт зоны (закроется или довнесёт залог).
+    for side in ("short", "long"):
+        z = out[side]
+        if z is None:
+            continue
+        top = with_liq[z.pop("_top")]
+        if sens:
+            rest = [q for q in positions if q is not top]
+            z["p3_without_top"] = summarize(rest, oi, mark, sigma, curve, sens=False,
+                                            width=width)["pillar3"]
+    # Вариант B (справочно, отведён 11.10): каждая позиция в пределах 8 ходов
+    # с весом своей вероятности дойти за 7 дней.
+    exp_vol = {True: 0.0, False: 0.0}
+    for d, size, _ in rows:
+        k = _k(d, sigma)
+        if 0 < k <= MT.K_MAX:
+            exp_vol[d > 0] += size * MT.interp(curve["k"], curve[d > 0], k)
+    out["exp_up_usd"], out["exp_down_usd"] = exp_vol[True], exp_vol[False]
+    tot = exp_vol[True] + exp_vol[False]
+    out["pillar3_vol"] = 100.0 * (exp_vol[True] - exp_vol[False]) / tot if tot else None
+    return out
+
+
+def print_summary(s: dict, top) -> None:
+    print(f"\nHYPERLIQUID, BTC — цена {s['mark']:,.0f}; открытый интерес {s['oi_btc']:,.0f} BTC "
+          f"(${s['oi_btc'] * s['mark'] / 1e9:.2f} млрд)")
+    print(f"Счетов просмотрено {top}, позиций BTC найдено {s['n_pos']}")
+    print(f"ПОКРЫТИЕ: лонги {s['long_btc']:,.0f} BTC = {100 * s['cover_long']:.0f}% интереса, "
+          f"шорты {s['short_btc']:,.0f} BTC = {100 * s['cover_short']:.0f}%")
+    if s["cover_long"] and s["cover_long"] > 1.05:
+        print("   [!] Покрытие больше 100% — проверить единицы openInterest")
+    print(f"Без цены ликвидации (залог не даёт ликвидации): лонги ${s['no_liq_long_usd'] / 1e6:,.0f} млн, "
+          f"шорты ${s['no_liq_short_usd'] / 1e6:,.0f} млн")
+    print(f"Типичный дневной ход (30 дней): {100 * s['sigma']:.2f}%\n")
+    for side, name in (("short", "СТОПЫ ШОРТОВ (сверху)"), ("long", "СТОПЫ ЛОНГОВ (снизу)")):
+        z = s[side]
+        if not z:
+            print(f"{name}: в пределах 8 дневных ходов нет")
+            continue
+        n = z["near"]
+        print(f"{name}: самая плотная зона {z['dist_pct']:+.1f}% от цены "
+              f"(окно {z['lo_pct']:+.1f}…{z['hi_pct']:+.1f}%; ${z['size_usd'] / 1e6:,.1f} млн, "
+              f"{100 * z['share']:.0f}% стопов стороны), "
+              f"{z['k']:.1f} дн. хода → дойти за 7 дней: {100 * z['p7']:.0f}%")
+        print(f"   объём стопов в пределах 2% / 5% / 10%: ${n[2] / 1e6:,.0f} / ${n[5] / 1e6:,.0f} / "
+              f"${n[10] / 1e6:,.0f} млн")
+        print(f"   в зоне счетов: {z['n_acc']}, крупнейший — {100 * z['top_share']:.0f}% зоны; "
+              f"позиций стороны в пределах 8 ходов: {z['n_reach']}")
+    if s["pillar3"] is not None:
+        print(f"\nСТОЛП 3 = {s['pillar3']:+.0f}  (плюс — ближе стопы шортов, минус — лонгов; −100…+100)")
+        alt = [(n, (s[sd] or {}).get("p3_without_top")) for sd, n in (("short", "шортов"), ("long", "лонгов"))]
+        alt = [(n, v) for n, v in alt if v is not None]
+        if alt:
+            print("   Хрупкость (справка, не условие) — без крупнейшего счёта зоны: " +
+                  "; ".join(f"зоны {n} {v:+.0f}" for n, v in alt))
+    if s.get("pillar3_vol") is not None:
+        print(f"Вариант B ({B_NOTE}): шортов ${s['exp_up_usd'] / 1e6:,.1f} млн, "
+              f"лонгов ${s['exp_down_usd'] / 1e6:,.1f} млн → {s['pillar3_vol']:+.0f}")
+    print("   Выборка: крупнейшие счета Hyperliquid из таблицы лидеров и HLP. Не весь рынок.")
+
+
+def print_hlp(rows: list, oi: float, mark: float) -> None:
+    print(f"\nХРАНИЛИЩЕ HLP: адресов {len(rows)} (родитель и дочерние)")
+    tot = {True: 0.0, False: 0.0}
+    for a, p, note in rows:
+        if p:
+            side = p["szi"] > 0
+            tot[side] += abs(p["szi"])
+            liq = f"ликвидация {p['liq']:,.0f}" if p["liq"] else "без цены ликвидации"
+            print(f"   {a[:10]}…: {'лонг' if side else 'шорт'} {abs(p['szi']):,.2f} BTC "
+                  f"(${abs(p['szi']) * mark / 1e6:,.1f} млн, {100 * abs(p['szi']) / oi:.1f}% интереса), "
+                  f"{liq}; {note}")
+        else:
+            print(f"   {a[:10]}…: {note}")
+    print(f"   Итого HLP: лонги {tot[True]:,.1f} BTC, шорты {tot[False]:,.1f} BTC "
+          f"({100 * (tot[True] + tot[False]) / oi:.1f}% интереса)")
+
+
+# --------------------------------------------------------------------------
+# Прогон
+# --------------------------------------------------------------------------
+
+def cuts_for(n: int) -> tuple:
+    return tuple(c for c in CUTS if c < n) + (n,)
+
+
+def stability(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict,
+              cuts=None) -> None:
+    """Совпадает ли картина у N крупнейших счетов при разном N."""
+    have_rank = cuts is not None and all("rank" in p for p in positions)
+    print("\nУСТОЙЧИВОСТЬ — та же картина по меньшей выборке:")
+    if not have_rank:
+        print("   (в снимке нет ранга счёта — режу по порядку позиций: доля 25/50/100%)")
+    elif any(p["rank"] < 0 for p in positions):
+        print("   (позиции HLP входят во все строки)")
+    print(f"   {'выборка':>16}{'покр. Л/Ш':>12}{'шорты: зона, P7':>20}{'лонги: зона, P7':>20}"
+          f"{'столп 3':>9}{'вар. B':>8}")
+    n = len(positions)
+    variants = ([(f"топ {c}", [p for p in positions if p["rank"] < c]) for c in cuts] if have_rank
+                else [(f"{q}% позиций", positions[: max(1, n * q // 100)]) for q in (25, 50, 100)])
+    for name, sub in variants:
+        if not sub:
+            continue
+        z = summarize(sub, oi, mark, sigma, curve, sens=False)
+        f = lambda w: f"{w['dist_pct']:+.1f}%, {100 * w['p7']:.0f}%" if w else "—"
+        p3 = "—" if z["pillar3"] is None else f"{z['pillar3']:+.0f}"
+        pv = "—" if z["pillar3_vol"] is None else f"{z['pillar3_vol']:+.0f}"
+        print(f"   {name:>16}{100 * z['cover_long']:>6.0f}/{100 * z['cover_short']:<5.0f}"
+              f"{f(z['short']):>20}{f(z['long']):>20}{p3:>9}{pv:>8}")
+    print("   Если строки похожи — меньшая выборка даёт ту же картину, и неполное")
+    print("   покрытие, скорее всего, картину не искажает. Если расходятся — искажает.")
+
+
+def fetch_one(rank_addr):
+    rank, a = rank_addr
+    try:
+        p = btc_position(post({"type": "clearinghouseState", "user": a}))
+    except Exception as exc:                              # noqa: BLE001
+        return rank, a, None, str(exc)[:60]
+    return rank, a, p, None
+
+
+def add_hlp(positions: list, polled: list[str]) -> list:
+    """Позиции HLP: отмечает уже найденные, дозапрашивает те, что не в выборке."""
+    try:
+        addrs = hlp_addresses()
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[!] HLP: запрос vaultDetails не прошёл: {str(exc)[:60]}")
+        return []
+    seen = {a.lower() for a in polled}
+    by_addr = {p["addr"].lower(): p for p in positions}
+    out = []
+    for a in addrs:
+        low = a.lower()
+        if low in by_addr:
+            by_addr[low]["hlp"] = True
+            out.append((a, by_addr[low], "уже в выборке (таблица лидеров)"))
+        elif low in seen:
+            out.append((a, None, "в таблице лидеров, позиции BTC нет"))
+        else:
+            _, _, p, err = fetch_one((-1, a))
+            if err:
+                out.append((a, None, f"нет ответа: {err}"))
+            elif p:
+                p.update(addr=a, rank=-1, hlp=True)
+                positions.append(p)
+                out.append((a, p, "добавлен в выборку"))
+            else:
+                out.append((a, None, "позиции BTC нет"))
+    return out
+
+
+def sigma_at(rows: list, snap_ms: int) -> float | None:
+    """Дневной ход σ по дням, закрытым к моменту снимка (свеча [t, t+1д) закрыта при t+1д ≤ снимка)."""
+    idx = None
+    for i, r in enumerate(rows):
+        if r[0] + TC.DAY <= snap_ms:
+            idx = i
+    return None if idx is None else TC.daily_vol([r[3] for r in rows], idx)
+
+
+def stamp_ms(stamp: str) -> int:
+    return int(datetime.strptime(stamp[:13], "%Y%m%d_%H%M").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def poll(top: int, workers: int, known: bool) -> dict:
+    """Сетевая часть: рынок, таблица лидеров, позиции BTC, HLP. Без расчёта столпа."""
+    oi, mark = btc_market()
+    full = leaderboard()
+    n_top = len(full) if top <= 0 else min(top, len(full))
+    picked = list(enumerate(full[:n_top]))
+    what, utc_k = f"{n_top} крупнейших", None
+    if known:
+        utc_k, ks = load_known()
+        if not ks:
+            sys.exit("Нет списка держателей BTC — сначала полный опрос: py btc_hl_stops.py run --top 0")
+        extra = [(i, a) for i, a in enumerate(full[n_top:], n_top) if a.lower() in ks]
+        picked += extra
+        what += f" + {len(extra)} держателей BTC из полного опроса {utc_k}"
+    addrs = [a for _, a in picked]
+    print(f"Опрашиваю {len(addrs)} счетов ({what}); ≈ {len(addrs) / MAX_PER_MIN:.0f} мин")
+    step = max(250, len(addrs) // 20)
+    positions, errors, first_err, t0, done = [], 0, None, time.time(), 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for rank, a, p, err in ex.map(fetch_one, picked):
+            done += 1
+            if err:
+                errors += 1
+                first_err = first_err or err
+            elif p:
+                p["addr"], p["rank"] = a, rank
+                positions.append(p)
+            if done % step == 0:
+                print(f"   {done}/{len(addrs)} счетов, позиций BTC {len(positions)}, "
+                      f"{(time.time() - t0) / 60:.1f} мин")
+    if errors:
+        print(f"[!] Не ответили {errors} счетов из {len(addrs)}; пример: {first_err}")
+    minutes = (time.time() - t0) / 60
+    print(f"Опрос занял {minutes:.1f} мин")
+    hlp = add_hlp(positions, addrs)
+    return {"oi": oi, "mark": mark, "full": full, "n_top": n_top, "addrs": addrs, "utc_k": utc_k,
+            "positions": positions, "hlp": hlp, "errors": errors, "minutes": minutes}
+
+
+def run(top: int, workers: int, known: bool = False) -> None:
+    if requests is None:
+        sys.exit("Нужен пакет requests: py -m pip install requests")
+    cpath = os.path.join(HERE, "p3_touch_curve.csv")
+    if not os.path.isfile(cpath):
+        sys.exit("Нет p3_touch_curve.csv — сначала: py btc_touch_curve.py run")
+    curve = MT.load_curve(cpath)
+    rows = TC.load(False)
+    sigma = sigma_at(rows, int(time.time() * 1000))
+    P = poll(top, workers, known)
+    oi, mark, full, n_top, addrs, utc_k = P["oi"], P["mark"], P["full"], P["n_top"], P["addrs"], P["utc_k"]
+    positions, hlp = P["positions"], P["hlp"]
+    s = summarize(positions, oi, mark, sigma, curve)
+    print_summary(s, len(addrs))
+    if hlp:
+        print_hlp(hlp, oi, mark)
+    stability(positions, oi, mark, sigma, curve, cuts_for(len(full) if known else n_top))
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    path = os.path.join(SNAP_DIR, f"hl_{stamp}.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"utc": stamp, "top": n_top, "polled": len(addrs), "leaderboard": len(full),
+                   "known_from": utc_k, "hlp": [a for a, _, _ in hlp],
+                   "summary": s, "positions": positions}, fh)
+    print(f"Снимок сохранён: {os.path.relpath(path, HERE)}")
+    if n_top == len(full):
+        save_known([p for p in positions if p["rank"] >= 0], stamp)
+        print(f"Список держателей BTC для ежедневного опроса обновлён: hl_known.json "
+              f"({len([p for p in positions if p['rank'] >= 0])} счетов)")
+
+
+# --------------------------------------------------------------------------
+# Облачный сборщик (GitHub Actions) и забор снимков на ноутбук — шаг 2а
+# --------------------------------------------------------------------------
+
+def _day_files(out: str, day: str) -> list[str]:
+    d = os.path.join(out, "hl", day[:4], day[4:6])
+    return sorted(f for f in os.listdir(d) if f.startswith(f"hl_{day}_")) if os.path.isdir(d) else []
+
+
+def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None) -> int:
+    """
+    Только сбор, без расчёта столпа (σ берётся с Binance, а Binance серверам
+    GitHub отказывает): позиции BTC, открытый интерес, цена, HLP.
+    auto: по воскресеньям (UTC), без списка держателей или если ему больше
+    8 суток — полный опрос; иначе ежедневный (топ N + держатели).
+    Второй запуск за те же сутки пропускается (ежедневный — если снимок за
+    сутки уже есть; полный — если уже есть полный).
+    """
+    global KNOWN_FILE
+    now = now or datetime.now(timezone.utc)
+    KNOWN_FILE = os.path.join(out, "hl_known.json")
+    utc_k, ks = None, set()
+    if os.path.isfile(KNOWN_FILE):
+        with open(KNOWN_FILE, encoding="utf-8") as fh:
+            k = json.load(fh)
+        utc_k, ks = k["utc"], set(k["addresses"])
+    if mode == "auto":
+        stale = utc_k is None or (now - datetime.strptime(utc_k[:13], "%Y%m%d_%H%M")
+                                  .replace(tzinfo=timezone.utc)).days >= 8
+        mode = "full" if (now.weekday() == 6 or not ks or stale) else "daily"
+    if mode == "daily" and not ks:
+        print("Списка держателей нет — делаю полный опрос")
+        mode = "full"
+    day = now.strftime("%Y%m%d")
+    have = _day_files(out, day)
+    if not force and (have if mode == "daily" else [f for f in have if f.endswith("_full.json.gz")]):
+        print(f"Снимок за {day} ({mode}) уже есть: {have[-1]} — пропускаю")
+        return 0
+    print(f"Сбор Hyperliquid: режим {mode}, {now:%Y-%m-%d %H:%M} UTC")
+    P = poll(top if mode == "daily" else 0, workers, mode == "daily")
+    pos, n = P["positions"], len(P["addrs"])
+    if not pos or P["errors"] > n / 2:
+        print(f"[!] Сбор не удался: позиций {len(pos)}, без ответа {P['errors']} из {n} — снимок не сохранён")
+        return 1
+    L = sum(p["szi"] for p in pos if p["szi"] > 0)
+    S = -sum(p["szi"] for p in pos if p["szi"] < 0)
+    stamp = now.strftime("%Y%m%d_%H%M")
+    summary = {"oi_btc": P["oi"], "mark": P["mark"], "sigma": None, "n_pos": len(pos),
+               "long_btc": L, "short_btc": S, "cover_long": L / P["oi"], "cover_short": S / P["oi"]}
+    d = os.path.join(out, "hl", day[:4], day[4:6])
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"hl_{stamp}_{mode}.json.gz")
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        json.dump({"utc": stamp, "kind": mode, "top": P["n_top"], "polled": n, "leaderboard": len(P["full"]),
+                   "known_from": P["utc_k"], "hlp": [a for a, _, _ in P["hlp"]], "errors": P["errors"],
+                   "minutes": round(P["minutes"], 1), "summary": summary, "positions": pos}, fh)
+    if mode == "full":
+        save_known([p for p in pos if p["rank"] >= 0], stamp)
+    log = os.path.join(out, "hl_log.csv")
+    new = not os.path.isfile(log)
+    with open(log, "a", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(["utc", "kind", "polled", "positions", "errors", "minutes",
+                        "cover_long", "cover_short", "oi_btc", "mark"])
+        w.writerow([stamp, mode, n, len(pos), P["errors"], f"{P['minutes']:.1f}",
+                    f"{L / P['oi']:.4f}", f"{S / P['oi']:.4f}", f"{P['oi']:.2f}", f"{P['mark']:.1f}"])
+    print(f"Снимок: {os.path.relpath(path, out)}; позиций {len(pos)}; покрытие лонги "
+          f"{100 * L / P['oi']:.0f}%, шорты {100 * S / P['oi']:.0f}%")
+    return 0
+
+
+def _gh_tree() -> dict:
+    r = requests.get(f"https://api.github.com/repos/{REPO}/git/trees/main?recursive=1", timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def _gh_raw(path: str) -> bytes:
+    r = requests.get(f"https://raw.githubusercontent.com/{REPO}/main/{path}", timeout=120)
+    r.raise_for_status()
+    return r.content
+
+
+def sync() -> None:
+    """Забрать на ноутбук новые снимки облачного сборщика в hl_snapshots/."""
+    tree = _gh_tree()
+    files = [t["path"] for t in tree.get("tree", []) if t.get("type") == "blob"
+             and t["path"].startswith("data/hl/") and t["path"].endswith(".json.gz")]
+    if tree.get("truncated"):
+        print("[!] Список файлов GitHub обрезан — часть снимков не видна")
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    new = [f for f in files if not os.path.isfile(os.path.join(SNAP_DIR, os.path.basename(f)))]
+    for f in new:
+        with open(os.path.join(SNAP_DIR, os.path.basename(f)), "wb") as fh:
+            fh.write(_gh_raw(f))
+    print(f"Снимков в облаке {len(files)}, забрано новых {len(new)}"
+          + (f"; последний — {os.path.basename(sorted(files)[-1])}" if files else ""))
+    if any(t["path"] == "data/hl_known.json" for t in tree.get("tree", [])):
+        cloud = json.loads(_gh_raw("data/hl_known.json"))
+        local = None
+        if os.path.isfile(os.path.join(HERE, "hl_known.json")):
+            with open(os.path.join(HERE, "hl_known.json"), encoding="utf-8") as fh:
+                local = json.load(fh)
+        if local is None or cloud["utc"] > local["utc"]:
+            with open(os.path.join(HERE, "hl_known.json"), "w", encoding="utf-8") as fh:
+                json.dump(cloud, fh)
+            print(f"Список держателей BTC обновлён из облака (полный опрос {cloud['utc']})")
+
+
+def latest_snapshot() -> str:
+    fs = [f for f in os.listdir(SNAP_DIR) if f.startswith("hl_") and (f.endswith(".json") or f.endswith(".json.gz"))] \
+        if os.path.isdir(SNAP_DIR) else []
+    if not fs:
+        sys.exit("В hl_snapshots/ снимков нет")
+    return os.path.join(SNAP_DIR, max(fs, key=lambda f: f[3:16]))
+
+
+def _load_snap(path: str):
+    if path == "latest":
+        path = latest_snapshot()
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fh:
+        snap = json.load(fh)
+    curve = MT.load_curve(os.path.join(HERE, "p3_touch_curve.csv"))
+    s0 = snap["summary"]
+    if s0.get("sigma") is None:                       # снимок облачного сборщика — σ считаем здесь
+        s0["sigma"] = sigma_at(TC.load(False), stamp_ms(snap["utc"]))
+    return snap, s0, curve
+
+
+def recompute(path: str) -> None:
+    """Пересчёт по сохранённому снимку без опроса биржи."""
+    snap, s0, curve = _load_snap(path)
+    s = summarize(snap["positions"], s0["oi_btc"], s0["mark"], s0["sigma"], curve)
+    top = snap.get("top")
+    print(f"Снимок {snap['utc']} UTC")
+    print_summary(s, snap.get("polled") or top or "? (в старом снимке не записано)")
+    span = snap.get("leaderboard") if snap.get("known_from") else top
+    stability(snap["positions"], s0["oi_btc"], s0["mark"], s0["sigma"], curve,
+              cuts_for(span) if span else None)
+
+
+def widths(path: str) -> None:
+    """Чувствительность зоны к ширине окна — один раз, для записи (аудитор, 11.10)."""
+    snap, s0, curve = _load_snap(path)
+    print(f"Снимок {snap['utc']} UTC — ширина окна зоны стопов\n")
+    print(f"   {'окно':>6}  {'шорты: зона (окно), $ млн, счетов, P7':<44}"
+          f"{'лонги: зона (окно), $ млн, счетов, P7':<44}{'столп 3':>8}")
+
+    def cell(z):
+        if not z:
+            return "—"
+        return (f"{z['dist_pct']:+.2f}% ({z['lo_pct']:+.2f}…{z['hi_pct']:+.2f}), "
+                f"{z['size_usd'] / 1e6:,.1f}, {z['n_acc']}, {100 * z['p7']:.0f}%")
+    for w in WIDTHS:
+        z = summarize(snap["positions"], s0["oi_btc"], s0["mark"], s0["sigma"], curve,
+                      sens=False, width=w)
+        p3 = "—" if z["pillar3"] is None else f"{z['pillar3']:+.1f}"
+        print(f"   {w:>5.1f}%  {cell(z['short']):<44}{cell(z['long']):<44}{p3:>8}")
+
+
+# --------------------------------------------------------------------------
+# Самопроверка
+# --------------------------------------------------------------------------
+
+def selftest() -> None:
+    st = {"assetPositions": [
+        {"position": {"coin": "ETH", "szi": "10", "entryPx": "3000", "liquidationPx": "2500",
+                      "leverage": {"type": "cross", "value": 5}, "positionValue": "30000"}},
+        {"position": {"coin": "BTC", "szi": "-2.5", "entryPx": "84000", "liquidationPx": "88000",
+                      "leverage": {"type": "isolated", "value": 20}, "positionValue": "210000"}}]}
+    p = btc_position(st)
+    assert p["szi"] == -2.5 and p["liq"] == 88000.0 and p["lev"] == 20
+    assert btc_position({"assetPositions": [{"position": {"coin": "BTC", "szi": "0"}}]}) is None
+    nl = btc_position({"assetPositions": [{"position": {"coin": "BTC", "szi": "1", "entryPx": "80000",
+                                                        "liquidationPx": None}}]})
+    assert nl["liq"] is None
+    curve = {"k": list(TC.K_GRID), True: [TC.rw_prob(k, 7) for k in TC.K_GRID],
+             False: [TC.rw_prob(k, 7) for k in TC.K_GRID]}
+    pos = [{"szi": -3.0, "liq": 86000.0}, {"szi": -1.0, "liq": 95000.0},     # шорты: +2,38% и +13,1%
+           {"szi": 4.0, "liq": 70000.0}, {"szi": 1.0, "liq": None}]         # лонги: −16,7%
+    s = summarize(pos, oi=10.0, mark=84000.0, sigma=0.02, curve=curve)
+    assert abs(s["cover_long"] - 0.5) < 1e-12 and abs(s["cover_short"] - 0.4) < 1e-12
+    assert abs(s["short"]["dist_pct"] - 100 * (86000 / 84000 - 1)) < 1e-9
+    assert s["long"] is None and s["pillar3"] is None                       # −16,7% дальше 8 ходов
+    pos.append({"szi": 2.0, "liq": 81000.0})                                # лонги −3,57%
+    s = summarize(pos, oi=10.0, mark=84000.0, sigma=0.02, curve=curve)
+    assert abs(s["long"]["dist_pct"] - 100 * (81000 / 84000 - 1)) < 1e-9 and s["pillar3"] > 0
+    # Кто в зоне и хрупкость
+    assert s["short"]["n_acc"] == 1 and s["short"]["top_share"] == 1.0 and s["short"]["n_reach"] == 2
+    assert s["long"]["n_reach"] == 1
+    assert s["short"]["p3_without_top"] < s["pillar3"]                     # без ближнего шорта — ниже
+    assert s["long"]["p3_without_top"] is None                             # лонгов в зоне не осталось
+    s2 = summarize(pos + [{"szi": -1.0, "liq": 86100.0}], oi=10.0, mark=84000.0, sigma=0.02, curve=curve)
+    assert s2["short"]["n_acc"] == 2 and abs(s2["short"]["top_share"] - 0.75) < 1e-12
+    # Скользящее окно против сетки: +10,74% и +10,76% — в разных корзинах сетки
+    # 0,5% (10,5 и 11,0), окно собирает их вместе (100 тыс. против 60 тыс. на +12%)
+    m = 100000.0
+    cl = [{"szi": -0.5, "liq": m * 1.1074}, {"szi": -0.5, "liq": m * 1.1076}, {"szi": -0.6, "liq": m * 1.12},
+          {"szi": 0.1, "liq": m * 0.97}]
+    z = summarize(cl, 10.0, m, 0.02, curve)["short"]
+    assert abs(z["size_usd"] - 100000) < 1e-6 and abs(z["dist_pct"] - 10.75) < 1e-6, z
+    assert abs(z["lo_pct"] - 10.74) < 1e-6 and abs(z["hi_pct"] - 10.76) < 1e-6
+    binned = {}
+    for q in cl[:3]:
+        b = 0.5 * round(100 * (q["liq"] / m - 1) / 0.5)
+        binned[b] = binned.get(b, 0) + abs(q["szi"]) * m
+    assert max(binned, key=binned.get) == 12.0                              # сетка ошиблась бы
+    z2 = summarize(cl, 10.0, m, 0.02, curve, width=2.0)["short"]
+    assert abs(z2["size_usd"] - 160000) < 1e-6 and z2["n_acc"] == 3
+    # Равенство сумм — берётся ближнее окно
+    tie = [{"szi": -1.0, "liq": m * 1.05}, {"szi": -1.0, "liq": m * 1.09}, {"szi": 0.1, "liq": m * 0.9}]
+    assert abs(summarize(tie, 10.0, m, 0.02, curve)["short"]["dist_pct"] - 5.0) < 1e-6
+    # Вариант B — независимый расчёт по случайному блужданию (кривая — та же формула)
+    def rw(liq, up):
+        d = math.log(liq / 84000.0) if up else -math.log(liq / 84000.0)
+        return TC.rw_prob(d / 0.02, 7)
+    up = 3 * 84000 * rw(86000, True) + 84000 * rw(95000, True)
+    dn = 2 * 84000 * rw(81000, False)                                       # 70 000 — дальше 8 ходов
+    assert abs(s["exp_up_usd"] / up - 1) < 0.03 and abs(s["exp_down_usd"] / dn - 1) < 0.03, (s, up, dn)
+    assert abs(s["pillar3_vol"] - 100 * (up - dn) / (up + dn)) < 2
+    # Ограничитель: 30 стартов при 6000/мин из 6 потоков — не быстрее 0,01 с между стартами
+    lim, starts = Limiter(6000), []
+
+    def hit(_):
+        lim.wait()
+        starts.append(time.monotonic())
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(hit, range(30)))
+    starts.sort()
+    assert starts[-1] - starts[0] >= 29 * 0.01 * 0.95, starts[-1] - starts[0]
+    # Полный прогон на подставной бирже: потоки, ранги, HLP, устойчивость, снимок, пересчёт
+    import random
+    import shutil
+    import tempfile
+    g = globals()
+    saved = {k: g[k] for k in ("HERE", "SNAP_DIR", "post", "btc_market", "leaderboard", "requests",
+                               "LIMIT", "CUTS", "HLP_VAULT", "KNOWN_FILE", "_gh_tree", "_gh_raw")}
+    saved_load = TC.load
+    tmp = tempfile.mkdtemp(prefix="hl_selftest_")
+    try:
+        with open(os.path.join(tmp, "p3_touch_curve.csv"), "w", encoding="utf-8") as fh:
+            fh.write("horizon_d,k,p_up,p_down\n")
+            for k in TC.K_GRID:
+                fh.write(f"7,{k},{TC.rw_prob(k, 7)},{TC.rw_prob(k, 7)}\n")
+        random.seed(3)
+        book = {}
+        for i in range(300):
+            if random.random() < 0.6:
+                sz = random.choice((-1, 1)) * random.uniform(0.1, 5)
+                liq = 84000 * (1 + (0.01 if sz < 0 else -0.01) * random.uniform(1, 15))
+                book[f"0x{i:040x}"] = {"assetPositions": [{"position": {
+                    "coin": "BTC", "szi": str(sz), "entryPx": "84000", "liquidationPx": str(liq),
+                    "leverage": {"type": "cross", "value": 10}, "positionValue": str(abs(sz) * 84000)}}]}
+            else:
+                book[f"0x{i:040x}"] = {"assetPositions": []}
+        lead = list(book)
+        in_book = next(a for a in lead if book[a]["assetPositions"] and not a.endswith("7"))
+        parent, child = "0x" + "a" * 40, "0x" + "b" * 40
+        extra = {parent: {"assetPositions": []},
+                 child: {"assetPositions": [{"position": {
+                     "coin": "BTC", "szi": "-12.5", "entryPx": "84000", "liquidationPx": "99000",
+                     "leverage": {"type": "cross", "value": 5}, "positionValue": "1050000"}}]}}
+
+        def fake_post(body, tries=5):
+            LIMIT.wait()
+            if body["type"] == "vaultDetails":
+                return {"relationship": {"type": "parent", "data": {"childAddresses": [in_book, child]}}}
+            u = body["user"]
+            if u.endswith("7"):                                  # часть счетов «не отвечает»
+                raise RuntimeError("тест: нет ответа")
+            return book.get(u) or extra[u]
+        g.update(HERE=tmp, SNAP_DIR=os.path.join(tmp, "snap"), post=fake_post,
+                 btc_market=lambda: (500.0, 84000.0), leaderboard=lambda: lead,
+                 requests=saved["requests"] or object(), LIMIT=Limiter(60000), CUTS=(100, 200),
+                 HLP_VAULT=parent)
+        rows = [(k * TC.DAY, 84000.0, 84000.0, 84000.0 * math.exp(0.02 * (-1) ** k)) for k in range(60)]
+        TC.load = lambda refresh=False: rows
+        print("--- подставная биржа: числа ниже выдуманные, проверяется только механика ---")
+        run(0, 6)
+        snaps = os.listdir(os.path.join(tmp, "snap"))
+        assert len(snaps) == 1 and os.path.isfile(os.path.join(tmp, "hl_known.json"))
+        snap = json.load(open(os.path.join(tmp, "snap", snaps[0]), encoding="utf-8"))
+        ranks = [p["rank"] for p in snap["positions"]]
+        assert ranks[:-1] == sorted(ranks[:-1]) and ranks[-1] == -1 and snap["top"] == 300
+        assert not any(p["addr"].endswith("7") for p in snap["positions"])
+        hl = [p for p in snap["positions"] if p.get("hlp")]
+        assert {p["addr"] for p in hl} == {in_book, child} and len(snap["hlp"]) == 3
+        print("\n--- пересчёт по снимку ---")
+        recompute(os.path.join(tmp, "snap", snaps[0]))
+        print("\n--- ширина окна ---")
+        widths(os.path.join(tmp, "snap", snaps[0]))
+        old = dict(snap, positions=[{k: v for k, v in p.items() if k not in ("rank", "hlp")}
+                                    for p in snap["positions"]])
+        del old["top"]
+        with open(os.path.join(tmp, "old.json"), "w", encoding="utf-8") as fh:
+            json.dump(old, fh)
+        print("\n--- пересчёт по снимку старого формата ---")
+        recompute(os.path.join(tmp, "old.json"))
+        # Ежедневный режим: топ 50 + держатели BTC из полного опроса — та же картина
+        full_s = snap["summary"]
+        _, ks = load_known()
+        holders = {p["addr"].lower() for p in snap["positions"] if p["rank"] >= 0}
+        assert ks == holders
+        os.remove(os.path.join(tmp, "snap", snaps[0]))
+        print("\n--- ежедневный режим: топ 50 + известные держатели ---")
+        run(50, 6, known=True)
+        new = [f for f in os.listdir(os.path.join(tmp, "snap")) if f.endswith(".json")]
+        d = json.load(open(os.path.join(tmp, "snap", new[0]), encoding="utf-8"))
+        expect = 50 + sum(1 for a in lead[50:] if a.lower() in holders)
+        assert d["polled"] == expect and d["known_from"] == snap["utc"], (d["polled"], expect)
+        assert abs(d["summary"]["long_btc"] - full_s["long_btc"]) < 1e-9     # покрытие то же
+        assert abs(d["summary"]["short_btc"] - full_s["short_btc"]) < 1e-9
+        # Запасной путь: hl_known.json нет — берётся снимок с охватом ≥ 20 000
+        os.remove(os.path.join(tmp, "hl_known.json"))
+        assert load_known() == (None, set())
+        big = dict(snap, top=47355, leaderboard=47355, utc="20991231_0000")
+        with open(os.path.join(tmp, "snap", "hl_20991231_0000.json"), "w", encoding="utf-8") as fh:
+            json.dump(big, fh)
+        assert load_known() == ("20991231_0000", holders)
+        # Облачный сборщик: воскресенье → полный; повтор в те же сутки → пропуск;
+        # понедельник → ежедневный (топ 50 + держатели); журнал; σ — на «ноутбуке»
+        out = os.path.join(tmp, "data")
+        sun = datetime(2026, 10, 18, 0, 10, tzinfo=timezone.utc)
+        mon = datetime(2026, 10, 19, 0, 10, tzinfo=timezone.utc)
+        assert sun.weekday() == 6
+        print("\n--- облачный сборщик: воскресенье ---")
+        assert collect("auto", 50, 6, out, now=sun) == 0
+        f_sun = _day_files(out, "20261018")
+        assert len(f_sun) == 1 and f_sun[0].endswith("_full.json.gz"), f_sun
+        assert os.path.isfile(os.path.join(out, "hl_known.json"))
+        assert collect("auto", 50, 6, out, now=sun) == 0 and len(_day_files(out, "20261018")) == 1
+        print("\n--- облачный сборщик: понедельник ---")
+        assert collect("auto", 50, 6, out, now=mon) == 0
+        f_mon = _day_files(out, "20261019")
+        assert len(f_mon) == 1 and f_mon[0].endswith("_daily.json.gz"), f_mon
+        assert collect("daily", 50, 6, out, now=mon) == 0 and len(_day_files(out, "20261019")) == 1
+        with gzip.open(os.path.join(out, "hl", "2026", "10", f_mon[0]), "rt", encoding="utf-8") as fh:
+            dm = json.load(fh)
+        assert dm["kind"] == "daily" and dm["polled"] == 50 + sum(1 for a in lead[50:] if a.lower() in holders)
+        with open(os.path.join(out, "hl_log.csv"), encoding="utf-8") as fh:
+            assert len(list(csv.reader(fh))) == 3                          # заголовок + 2 снимка
+        # «Ноутбук»: забрать снимки из «облака» и посчитать столп по последнему
+        tree = {"tree": [{"type": "blob",
+                          "path": os.path.relpath(os.path.join(dp, f), tmp).replace(os.sep, "/")}
+                         for dp, _, fs in os.walk(out) for f in fs]}
+        g.update(_gh_tree=lambda: tree, SNAP_DIR=os.path.join(tmp, "laptop"),
+                 _gh_raw=lambda path: open(os.path.join(tmp, path), "rb").read())
+        print("\n--- ноутбук: забрать снимки ---")
+        sync()
+        assert sorted(os.listdir(os.path.join(tmp, "laptop"))) == sorted(f_sun + f_mon)
+        with open(os.path.join(tmp, "hl_known.json"), encoding="utf-8") as fh:
+            assert json.load(fh)["utc"] == "20261018_0010"
+        sync()                                                              # повтор — ничего нового
+        snap_m, s0, _ = _load_snap("latest")
+        assert snap_m["kind"] == "daily" and s0["sigma"] is not None
+        print("\n--- ноутбук: столп 3 по последнему облачному снимку ---")
+        recompute("latest")
+        # σ — только по закрытым дням: свеча, открытая за сутки до снимка, ещё не закрыта
+        r40 = [(k * TC.DAY, 1, 1, 100 * math.exp(0.01 * k + 0.02 * (-1) ** k + (0.05 if k == 39 else 0)))
+               for k in range(40)]
+        c40 = [r[3] for r in r40]
+        assert sigma_at(r40, 39 * TC.DAY + 600_000) == TC.daily_vol(c40, 38) != TC.daily_vol(c40, 39)
+        assert sigma_at(r40, 40 * TC.DAY) == TC.daily_vol(c40, 39)
+    finally:
+        g.update(saved)
+        TC.load = saved_load
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("\nselftest: OK — разбор позиции, покрытие, скользящее окно (сетка ошиблась бы), равенство, "
+          "хрупкость, вариант B, ограничитель, параллельный прогон, HLP, снимок, пересчёт, ширины, "
+          "облачный сборщик (полный/ежедневный/повтор), забор на ноутбук, σ по закрытым дням, "
+          "ежедневный режим с известными держателями")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Стопы BTC на Hyperliquid сейчас")
+    sub = ap.add_subparsers(dest="mode", required=True)
+    sub.add_parser("selftest")
+    r = sub.add_parser("run")
+    r.add_argument("--top", type=int, default=2000, help="сколько крупнейших счетов; 0 — все")
+    r.add_argument("--workers", type=int, default=WORKERS)
+    r.add_argument("--known", action="store_true",
+                   help="добавить держателей BTC из последнего полного опроса (ежедневный режим)")
+    for name in ("recompute", "widths"):
+        sub.add_parser(name).add_argument("snapshot", help="путь к снимку или latest — последний")
+    c = sub.add_parser("collect", help="облачный сборщик (GitHub Actions)")
+    c.add_argument("--mode", dest="kind", choices=("auto", "daily", "full"), default="auto")
+    c.add_argument("--top", type=int, default=2000)
+    c.add_argument("--workers", type=int, default=WORKERS)
+    c.add_argument("--out", default=DATA_DIR)
+    c.add_argument("--force", action="store_true")
+    sub.add_parser("sync", help="забрать снимки облачного сборщика на ноутбук")
+    a = ap.parse_args()
+    if a.mode in ("run", "collect", "sync") and requests is None:
+        sys.exit("Нужен пакет requests: py -m pip install requests")
+    if a.mode == "collect":
+        sys.exit(collect(a.kind, a.top, a.workers, a.out, a.force))
+    if a.mode == "sync":
+        sync()
+        return
+    if a.mode == "selftest":
+        selftest()
+    elif a.mode == "recompute":
+        recompute(a.snapshot)
+    elif a.mode == "widths":
+        widths(a.snapshot)
+    else:
+        run(a.top, a.workers, a.known)
+
+
+if __name__ == "__main__":
+    main()
