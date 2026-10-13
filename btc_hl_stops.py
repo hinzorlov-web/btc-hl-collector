@@ -192,18 +192,45 @@ def load_known() -> tuple:
         with open(known_path(), encoding="utf-8") as fh:
             k = json.load(fh)
         return k["utc"], set(k["addresses"])
-    best = None
-    if os.path.isdir(SNAP_DIR):
-        for fn in sorted(os.listdir(SNAP_DIR)):
-            if fn.startswith("hl_") and fn.endswith(".json"):
-                with open(os.path.join(SNAP_DIR, fn), encoding="utf-8") as fh:
-                    snap = json.load(fh)
-                t = snap.get("leaderboard") or snap.get("top") or 0
-                if t >= 20000 and snap.get("top", 0) >= t and (best is None or snap["utc"] > best["utc"]):
-                    best = snap
+    best = _full_snapshots()
     if best:
-        return best["utc"], {p["addr"].lower() for p in best["positions"] if p.get("rank", 0) >= 0}
+        snap = best[-1][1]
+        return snap["utc"], {p["addr"].lower() for p in snap["positions"] if p.get("rank", 0) >= 0}
     return None, set()
+
+
+FULL_MIN = 20000           # полный опрос — не меньше стольких счетов таблицы лидеров
+
+
+def _read_snap(path: str) -> dict:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _is_full(snap: dict) -> bool:
+    """Полный опрос: облачный с пометкой full или ноутбучный run --top 0 (опрошены все счета)."""
+    if snap.get("kind"):
+        return snap["kind"] == "full"
+    t = snap.get("leaderboard") or snap.get("top") or 0
+    return t >= FULL_MIN and snap.get("top", 0) >= t
+
+
+def _full_snapshots(before: str | None = None) -> list:
+    """Полные снимки в hl_snapshots/ — [(utc, снимок, путь)] по возрастанию времени,
+    при before — только более ранние. Ежедневные облачные снимки не читаются."""
+    out = []
+    if not os.path.isdir(SNAP_DIR):
+        return out
+    for fn in sorted(os.listdir(SNAP_DIR)):
+        if not fn.startswith("hl_") or not (fn.endswith(".json") or fn.endswith(".json.gz")) \
+                or fn.endswith("_daily.json.gz") or (before and fn[3:16] >= before):
+            continue
+        path = os.path.join(SNAP_DIR, fn)
+        snap = _read_snap(path)
+        if _is_full(snap):
+            out.append((snap["utc"], snap, path))
+    return sorted(out, key=lambda x: x[0])
 
 
 def hlp_addresses() -> list[str]:
@@ -760,29 +787,44 @@ def sync() -> None:
             if local is not None:                      # прежний список — для проверки глубины
                 with open(os.path.join(HERE, f"hl_known_{local['utc']}.json"), "w", encoding="utf-8") as fh:
                     json.dump(local, fh)
+                print(f"Прежний список держателей сохранён: hl_known_{local['utc']}.json")
             with open(os.path.join(HERE, "hl_known.json"), "w", encoding="utf-8") as fh:
                 json.dump(cloud, fh)
             print(f"Список держателей BTC обновлён из облака (на {cloud['utc']}, "
                   f"полный опрос {cloud.get('full_utc', cloud['utc'])})")
 
 
-def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> None:
+def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> tuple:
     """
     Проверка глубины (аудитор, 13.10): воспроизводит ли ежедневный состав —
     топ N + держатели BTC из ПРЕДЫДУЩЕГО полного опроса — эталон (полный опрос).
     Держатели того же опроса дали бы совпадение по построению, поэтому список
-    берётся более ранний (hl_known_ГГГГММДД_ЧЧММ.json, его оставляет sync).
+    берётся более ранний: сохранённый sync список hl_known_ГГГГММДД_ЧЧММ.json
+    или, если его нет, более ранний полный снимок в hl_snapshots/ (держатели —
+    счета с позицией BTC в нём). Эталон по умолчанию — последний ПОЛНЫЙ снимок.
     """
+    if snap_path == "latest":
+        fulls = _full_snapshots()
+        if not fulls:
+            sys.exit("В hl_snapshots/ нет полного снимка")
+        snap_path = fulls[-1][2]
     snap, s0, curve = _load_snap(snap_path)
+    if not _is_full(snap):
+        print(f"[!] Снимок {snap['utc']} — не полный опрос; эталон из него неполный")
     if known_path_arg == "auto":
-        cands = sorted(f for f in os.listdir(HERE) if f.startswith("hl_known_") and f.endswith(".json")
-                       and f[9:22] < snap["utc"])
+        cands = [(f[9:22], os.path.join(HERE, f)) for f in os.listdir(HERE)
+                 if f.startswith("hl_known_") and f.endswith(".json") and f[9:22] < snap["utc"]]
+        cands += [(u, p) for u, _, p in _full_snapshots(before=snap["utc"])]
         if not cands:
-            sys.exit("Нет более раннего списка держателей (hl_known_ГГГГММДД_ЧЧММ.json)")
-        known_path_arg = os.path.join(HERE, cands[-1])
-    with open(known_path_arg, encoding="utf-8") as fh:
-        k = json.load(fh)
-    ks = set(k["addresses"])
+            sys.exit("Нет более раннего списка держателей: ни hl_known_ГГГГММДД_ЧЧММ.json, "
+                     "ни более раннего полного снимка в hl_snapshots/")
+        known_path_arg = max(cands)[1]
+    k = _read_snap(known_path_arg)
+    if "addresses" in k:
+        ks, src = set(k["addresses"]), "список"
+    else:
+        ks, src = {p["addr"].lower() for p in k["positions"] if p.get("rank", 0) >= 0}, "полный снимок"
+    print(f"Держатели: {src} {os.path.basename(known_path_arg)}")
     pos = [p for p in snap["positions"] if p.get("rank", 0) >= 0]
     sets = [("эталон: все счета", pos),
             (f"топ {top} + держатели от {k['utc']}", [p for p in pos if p["rank"] < top or p["addr"].lower() in ks]),
@@ -801,6 +843,7 @@ def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> None:
         print(f"   {name:<34}{len(sub):>8}{100 * z['cover_long']:>6.0f}/{100 * z['cover_short']:<4.0f}"
               f"{zs(z['short']):>13}{zs(z['long']):>13}{p3:>8}{near('short') + ' | ' + near('long'):>36}{cum:>16}")
     print("\n   Если вторая строка совпадает с первой — ежедневный состав годен как есть.")
+    return snap_path, known_path_arg
 
 
 def lbstats() -> None:
@@ -864,9 +907,7 @@ def latest_snapshot() -> str:
 def _load_snap(path: str):
     if path == "latest":
         path = latest_snapshot()
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as fh:
-        snap = json.load(fh)
+    snap = _read_snap(path)
     curve = MT.load_curve(os.path.join(HERE, "p3_touch_curve.csv"))
     s0 = snap["summary"]
     if s0.get("sigma") is None:                       # снимок облачного сборщика — σ считаем здесь
@@ -989,7 +1030,7 @@ def selftest() -> None:
     g = globals()
     saved = {k: g[k] for k in ("HERE", "SNAP_DIR", "post", "btc_market", "leaderboard_rows", "requests",
                                "LIMIT", "CUTS", "HLP_VAULT", "KNOWN_FILE", "_gh_tree", "_gh_raw",
-                               "_cb_daily")}
+                               "_cb_daily", "FULL_MIN")}
     saved_load = TC.load
     tmp = tempfile.mkdtemp(prefix="hl_selftest_")
     try:
@@ -1029,7 +1070,7 @@ def selftest() -> None:
                  leaderboard_rows=lambda: [{"ethAddress": a, "windowPerformances": [
                      ["day", {"vlm": "100" if i % 7 == 3 else "0"}]]} for i, a in enumerate(lead)],
                  requests=saved["requests"] or object(), LIMIT=Limiter(60000), CUTS=(100, 200),
-                 HLP_VAULT=parent)
+                 HLP_VAULT=parent, FULL_MIN=20000)
         rows = [(k * TC.DAY, 84000.0, 84000.0, 84000.0 * math.exp(0.02 * (-1) ** k)) for k in range(60)]
         TC.load = lambda refresh=False: rows
         g["_cb_daily"] = lambda days=60: rows
@@ -1140,7 +1181,24 @@ def selftest() -> None:
         with open(os.path.join(tmp, "hl_known.json"), encoding="utf-8") as fh:
             assert json.load(fh)["utc"] == "20261019_0010"
         print("\n--- проверка глубины: полный снимок против топ 50 + прежних держателей ---")
-        depth(os.path.join(tmp, "laptop", f_sun[0]), "auto", top=50)
+        used = depth(os.path.join(tmp, "laptop", f_sun[0]), "auto", top=50)
+        assert os.path.basename(used[1]) == "hl_known_20261011_2209.json"
+        # Ноутбук без сохранённого списка (полный опрос 11.10 сделан версией без hl_known.json,
+        # ошибка №62): держатели берутся из более раннего полного снимка; эталон по умолчанию —
+        # последний ПОЛНЫЙ снимок, а не последний ежедневный
+        os.remove(os.path.join(tmp, "hl_known_20261011_2209.json"))
+        g["FULL_MIN"] = 100
+        with open(os.path.join(tmp, "laptop", "hl_20261011_2209.json"), "w", encoding="utf-8") as fh:
+            json.dump(dict(snap, utc="20261011_2209"), fh)
+        with open(os.path.join(tmp, "laptop", "hl_20261012_1500.json"), "w", encoding="utf-8") as fh:
+            json.dump(dict(snap, utc="20261012_1500", top=50), fh)          # не полный — не годится
+        print("\n--- проверка глубины: держатели из более раннего полного снимка ---")
+        used = depth("latest", "auto", top=50)
+        assert os.path.basename(used[0]) == f_sun[0], used
+        assert os.path.basename(used[1]) == "hl_20261011_2209.json", used
+        os.remove(os.path.join(tmp, "laptop", "hl_20261011_2209.json"))
+        os.remove(os.path.join(tmp, "laptop", "hl_20261012_1500.json"))
+        g["FULL_MIN"] = 20000
         # Таблица лидеров: есть ли активность по счетам
         class _R:
             def raise_for_status(self):
@@ -1187,7 +1245,7 @@ def selftest() -> None:
     print("\nselftest: OK — разбор позиции, покрытие, скользящее окно (сетка ошиблась бы), равенство, "
           "хрупкость, вариант B, ограничитель, параллельный прогон, HLP, снимок, пересчёт, ширины, "
           "облачный сборщик (полный/ежедневный/повтор), забор на ноутбук, σ по закрытым дням, "
-          "кумулятивная версия, проверка глубины, активность таблицы лидеров, "
+          "кумулятивная версия, проверка глубины (список или ранний полный снимок), активность таблицы лидеров, "
           "ежедневный режим с известными держателями")
 
 
