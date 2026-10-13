@@ -91,10 +91,19 @@ DATA_DIR = os.path.join(HERE, "data")       # куда пишет сборщик
 KNOWN_FILE = None                           # путь к hl_known.json (сборщик задаёт свой)
 CUM_K = (1, 2, 4)                           # кумулятивная версия: пределы в дневных ходах
 COINBASE = "https://api.exchange.coinbase.com/products/BTC-USD/candles"   # σ в облаке (аудитор, 13.10)
+# Строка ряда столпа 3: всё, чтобы объяснить день без повторного прогона (аудитор, 13.10 вечер):
+# границы зон, суммы, счета, доля крупнейшего, σ, кумулятивная 1/2/4σ с долями сторон,
+# нормировочная база (условные суммы лонгов и шортов в выборке), хрупкость, покрытие.
+# Новые колонки дописываются в конец — старые строки сохраняются (_append_csv).
 P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", "zone_short_pct",
            "zone_long_pct", "zone_short_usd", "zone_long_usd", "acc_short", "acc_long", "top_short",
            "top_long", "p3_wo_top_short", "p3_wo_top_long", "cum1", "cum2", "cum4",
-           "cover_long", "cover_short", "positions", "polled"]
+           "cover_long", "cover_short", "positions", "polled",
+           "zone_short_lo", "zone_short_hi", "zone_long_lo", "zone_long_hi", "k_short", "k_long",
+           "reach_short", "reach_long", "short_usd", "long_usd",
+           "cum1_short", "cum1_long", "cum2_short", "cum2_long", "cum4_short", "cum4_long",
+           "near2_short", "near5_short", "near10_short", "near2_long", "near5_long", "near10_long",
+           "mark", "oi_btc", "instrument"]
 
 
 class Limiter:
@@ -647,6 +656,11 @@ def _append_log(path: str, row: dict) -> None:
     _append_csv(path, row, LOG_COLS)
 
 
+def _near(s: dict, side: str, t: int):
+    nd = (s.get(side) or {}).get("near") or {}
+    return nd.get(t, nd.get(str(t)))
+
+
 def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dict:
     """Строка ежедневного ряда столпа 3 (для индекса)."""
     f = lambda x, n=4: "" if x is None else f"{x:.{n}f}"
@@ -661,7 +675,16 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
             "cum1": f((c.get("1") or {}).get("value"), 2), "cum2": f((c.get("2") or {}).get("value"), 2),
             "cum4": f((c.get("4") or {}).get("value"), 2),
             "cover_long": f(s["cover_long"]), "cover_short": f(s["cover_short"]),
-            "positions": s["n_pos"], "polled": polled}
+            "positions": s["n_pos"], "polled": polled,
+            "zone_short_lo": f(sh.get("lo_pct"), 2), "zone_short_hi": f(sh.get("hi_pct"), 2),
+            "zone_long_lo": f(lo.get("lo_pct"), 2), "zone_long_hi": f(lo.get("hi_pct"), 2),
+            "k_short": f(sh.get("k"), 3), "k_long": f(lo.get("k"), 3),
+            "reach_short": sh.get("n_reach", ""), "reach_long": lo.get("n_reach", ""),
+            "short_usd": f(s.get("short_usd"), 0), "long_usd": f(s.get("long_usd"), 0),
+            **{f"cum{k}_{side}": f((c.get(str(k)) or {}).get(side), 5)
+               for k in CUM_K for side in ("short", "long")},
+            **{f"near{t}_{side}": f(_near(s, side, t), 0) for t in (2, 5, 10) for side in ("short", "long")},
+            "mark": f(s.get("mark"), 1), "oi_btc": f(s.get("oi_btc"), 2), "instrument": "Hyperliquid"}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -1144,6 +1167,8 @@ def selftest() -> None:
         with open(os.path.join(out, "hl_log.csv"), "w", encoding="utf-8", newline="") as fh:
             fh.write("utc,kind,polled,positions,errors,minutes,cover_long,cover_short,oi_btc,mark\n"
                      "20261013_1022,full,47000,3200,0,95.0,0.4,0.4,37000,83000\n")
+        with open(os.path.join(out, "pillar3_daily.csv"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(",".join(P3_COLS[:24]) + "\n" + "20261014_0010,daily" + ",1" * 22 + "\n")
         print("\n--- облачный сборщик: воскресенье ---")
         assert collect("auto", 50, 6, out, now=sun) == 0
         f_sun = _day_files(out, "20261018")
@@ -1181,7 +1206,12 @@ def selftest() -> None:
         assert dm["summary"]["sigma_src"] == "coinbase" and dm["summary"]["pillar3"] is not None
         with open(os.path.join(out, "pillar3_daily.csv"), encoding="utf-8") as fh:
             pr = list(csv.DictReader(fh))
-        assert [r["kind"] for r in pr] == ["full", "daily"] and pr[1]["cum2"] != ""
+        assert [r["kind"] for r in pr] == ["daily", "full", "daily"] and pr[2]["cum2"] != ""
+        assert pr[0]["utc"] == "20261014_0010" and pr[0]["short_usd"] == ""        # старая строка цела
+        r2, c2 = pr[2], dm["summary"]["cum"]
+        assert abs(float(r2["short_usd"]) - dm["summary"]["short_usd"]) < 1
+        assert abs(float(r2["cum2_short"]) - c2["2"]["short"]) < 1e-4 and r2["instrument"] == "Hyperliquid"
+        assert r2["near10_long"] != "" and r2["zone_short_lo"] != "" and r2["k_short"] != ""
         # «Ноутбук»: забрать снимки из «облака» и посчитать столп по последнему
         tree = {"tree": [{"type": "blob",
                           "path": os.path.relpath(os.path.join(dp, f), tmp).replace(os.sep, "/")}
@@ -1259,7 +1289,7 @@ def selftest() -> None:
                        encoding="utf-8") as fh:
             assert json.load(fh)["summary"]["sigma"] is None
         with open(os.path.join(out, "pillar3_daily.csv"), encoding="utf-8") as fh:
-            assert len(list(csv.DictReader(fh))) == 2
+            assert len(list(csv.DictReader(fh))) == 3
         # σ — только по закрытым дням: свеча, открытая за сутки до снимка, ещё не закрыта
         r40 = [(k * TC.DAY, 1, 1, 100 * math.exp(0.01 * k + 0.02 * (-1) ** k + (0.05 if k == 39 else 0)))
                for k in range(40)]
