@@ -16,18 +16,23 @@ btc_hl_stops.py — где стоят стопы BTC сейчас: Hyperliquid, 
 параллельно (6 потоков), по открытому соединению, не больше 500 в минуту:
 2000 счетов — 4 мин (11.10), все ~47 тыс. — около 95 мин.
 
-Столп 3 («7 дней», принят аудитором 11.10): самая плотная зона стопов сверху
-(шорты) и снизу (лонги), расстояние в дневных ходах, вероятность дойти за
-7 дней по кривой p3_touch_curve.csv. Столп 3 = P(вверх) − P(вниз), −100…+100.
+Столп 3 — версия D (принята аудитором 15.10, PROJECT.md 6.34): каждая позиция
+со стопом в пределах 8 дневных ходов входит СВОИМ размером, умноженным на
+вероятность, что цена дойдёт до её стопа за 7 дней (кривая p3_touch_curve.csv).
+Сумма по стороне — ожидаемый объём принудительных закрытий за 7 дней:
+R↑ (стопы шортов сверху) и R↓ (стопы лонгов снизу). Делится на открытый
+интерес выборки (все найденные позиции, и без цены ликвидации тоже):
+  D = 100·(R↑ − R↓) / OI выборки — направление: плюс — уязвимее шорты
+      (цена скорее прыгнет вверх к их стопам), минус — лонги. Входит в индекс.
+  T = 100·(R↑ + R↓) / OI выборки — величина риска в обе стороны, топливо для
+      каскада. Печатается рядом с D, в индекс не входит.
+  Хрупкость — D без крупнейшего счёта той стороны, что даёт знак.
+Ограничение (печатается словами): D — ожидание при обычном распределении цены;
+каскад (ликвидации сами двигают цену дальше) не учтён, в каскаде D занижает риск.
 
-ЗОНА (с 12.10, правило записано до прогона): скользящее окно шириной 0,5 п.п.
-расстояния вместо фиксированной сетки 0,5% — сетка резала скопление по
-границе корзины (ошибка №58). Окно перебирается по позициям в пределах
-8 дневных ходов, берётся максимум суммы размеров; при равенстве — ближнее
-к цене; расстояние зоны — среднее расстояние её позиций, взвешенное размером.
-
-Справочно, не условие: столп 3 без крупнейшего счёта каждой зоны (хрупкость)
-и вариант B «ожидаемый вынос за 7 дней» (отведён 11.10, не развивается).
+Зонная версия «7 дней» (11.10–15.10, отведена: размер входил только через
+выбор самой плотной зоны, ошибка №72) считается и пишется в ряд справочно —
+колонка pillar3, для сравнения со старыми строками.
 
 Каждый прогон сохраняется в hl_snapshots/ — так копится собственная история.
 
@@ -39,6 +44,8 @@ btc_hl_stops.py — где стоят стопы BTC сейчас: Hyperliquid, 
                                                      обновляет список держателей hl_known.json
   py btc_hl_stops.py recompute hl_snapshots/hl_ГГГГММДД_ЧЧММ.json   — пересчёт без опроса
   py btc_hl_stops.py widths hl_snapshots/hl_ГГГГММДД_ЧЧММ.json      — ширина окна 0,5/1/2%
+  py btc_hl_stops.py cutoffs latest               — D при обрезке 6/8/12σ (один раз, аудитор 15.10)
+  py btc_hl_stops.py refill [--csv путь]          — дописать новые колонки ряда по сохранённым снимкам
   py btc_hl_stops.py sync                         — забрать снимки облачного сборщика
   py btc_hl_stops.py recompute latest             — столп 3 по последнему снимку
   python btc_hl_stops.py collect [--mode auto]    — облачный сборщик (GitHub Actions)
@@ -103,7 +110,12 @@ P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", 
            "reach_short", "reach_long", "short_usd", "long_usd",
            "cum1_short", "cum1_long", "cum2_short", "cum2_long", "cum4_short", "cum4_long",
            "near2_short", "near5_short", "near10_short", "near2_long", "near5_long", "near10_long",
-           "mark", "oi_btc", "instrument"]
+           "mark", "oi_btc", "instrument",
+           # версия D (15.10): направление, величина, хрупкость, суммы сторон, база
+           "d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd"]
+CUTOFFS = (6.0, 8.0, 12.0)                  # чувствительность D к обрезке — один прогон (аудитор, 15.10)
+D_LIMIT = ("Ограничение: D — ожидаемый объём при обычном распределении цены; каскад (ликвидации "
+           "сами двигают цену дальше) не учтён — в каскаде D занижает риск. Высокий T — топливо для каскада.")
 
 
 class Limiter:
@@ -302,6 +314,50 @@ def densest_window(rows: list, up: bool, sigma: float, width: float = WIN_PCT) -
             "top_share": top[1] / size, "_top": top[2], "n_reach": len(side)}
 
 
+def expected_closures(rows: list, sigma: float, curve: dict, k_max: float | None = None,
+                      tail: str = "flat") -> tuple:
+    """
+    R↑, R↓ — ожидаемый объём принудительных закрытий за 7 дней по сторонам
+    (True — шорты, стопы сверху): размер позиции × P(дойти за 7 дней) по всем
+    позициям в пределах k_max дневных ходов. Ожидание линейно — складывать
+    законно, хотя события вложены (дойдя до 5σ, цена прошла и 1σ).
+    За последней точкой кривой (8σ) вероятности нет: tail="flat" — как в 8σ
+    (верхняя граница, кривая убывает), "zero" — ноль (нижняя граница).
+    Возвращает (R, вклады [(вклад, сторона, размер)]).
+    """
+    k_max = MT.K_MAX if k_max is None else k_max
+    k_last = curve["k"][-1]
+    R, contrib = {True: 0.0, False: 0.0}, []
+    for d, size, _ in rows:
+        k = _k(d, sigma)
+        if not 0 < k <= k_max or (tail == "zero" and k > k_last):
+            continue
+        c = size * MT.interp(curve["k"], curve[d > 0], k)
+        R[d > 0] += c
+        contrib.append((c, d > 0, size))
+    return R, contrib
+
+
+def d_block(R: dict, contrib: list, oi_s: float) -> dict:
+    """D, T и хрупкость D (без крупнейшего счёта стороны, что даёт знак)."""
+    o = {"oi_sample_usd": oi_s, "r_up_usd": R[True], "r_down_usd": R[False],
+         "d": None, "t": None, "d_wo_top": None, "d_lead": None, "d_top_share": None, "d_top_usd": None}
+    if not oi_s:
+        return o
+    o["d"] = 100.0 * (R[True] - R[False]) / oi_s
+    o["t"] = 100.0 * (R[True] + R[False]) / oi_s
+    if R[True] == R[False]:
+        return o
+    lead = R[True] > R[False]
+    c, _, size = max((x for x in contrib if x[1] == lead), key=lambda x: x[0])
+    r = dict(R)
+    r[lead] -= c
+    rest = oi_s - size                      # счёт уходит и из базы
+    o["d_wo_top"] = 100.0 * (r[True] - r[False]) / rest if rest > 0 else None
+    o["d_lead"], o["d_top_share"], o["d_top_usd"] = ("short" if lead else "long"), c / R[lead], size
+    return o
+
+
 def summarize(positions: list[dict], oi: float, mark: float, sigma: float,
               curve: dict, sens: bool = True, width: float = WIN_PCT) -> dict:
     longs = [p for p in positions if p["szi"] > 0]
@@ -339,16 +395,14 @@ def summarize(positions: list[dict], oi: float, mark: float, sigma: float,
             rest = [q for q in positions if q is not top]
             z["p3_without_top"] = summarize(rest, oi, mark, sigma, curve, sens=False,
                                             width=width)["pillar3"]
-    # Вариант B (справочно, отведён 11.10): каждая позиция в пределах 8 ходов
-    # с весом своей вероятности дойти за 7 дней.
-    exp_vol = {True: 0.0, False: 0.0}
-    for d, size, _ in rows:
-        k = _k(d, sigma)
-        if 0 < k <= MT.K_MAX:
-            exp_vol[d > 0] += size * MT.interp(curve["k"], curve[d > 0], k)
+    # Версия D (принята 15.10): ожидаемый объём закрытий за 7 дней по сторонам,
+    # нормировка — открытый интерес выборки (все позиции, и без цены ликвидации).
+    # Влияние любого счёта ограничено его долей в этом интересе.
+    exp_vol, contrib = expected_closures(rows, sigma, curve)
     out["exp_up_usd"], out["exp_down_usd"] = exp_vol[True], exp_vol[False]
     tot = exp_vol[True] + exp_vol[False]
-    out["pillar3_vol"] = 100.0 * (exp_vol[True] - exp_vol[False]) / tot if tot else None
+    out["pillar3_vol"] = 100.0 * (exp_vol[True] - exp_vol[False]) / tot if tot else None   # = D/T
+    out.update(d_block(exp_vol, contrib, (L + S) * mark))
     # Кумулятивная версия (аудитор, 13.10): доля условной суммы стороны, чьи
     # ликвидации в пределах k дневных ходов от цены; нормировка — на всю сторону
     # в выборке (включая позиции без цены ликвидации). Без окна, сетки и максимума.
@@ -393,13 +447,13 @@ def print_summary(s: dict, top) -> None:
               f"${n[10] / 1e6:,.0f} млн")
         print(f"   в зоне счетов: {z['n_acc']}, крупнейший — {100 * z['top_share']:.0f}% зоны; "
               f"позиций стороны в пределах 8 ходов: {z['n_reach']}")
+    print_d(s)
     if s["pillar3"] is not None:
-        print(f"\nСТОЛП 3 = {s['pillar3']:+.0f}  (плюс — ближе стопы шортов, минус — лонгов; −100…+100)")
         alt = [(n, (s[sd] or {}).get("p3_without_top")) for sd, n in (("short", "шортов"), ("long", "лонгов"))]
         alt = [(n, v) for n, v in alt if v is not None]
-        if alt:
-            print("   Хрупкость (справка, не условие) — без крупнейшего счёта зоны: " +
-                  "; ".join(f"зоны {n} {v:+.0f}" for n, v in alt))
+        print(f"Зонная версия «7 дней» (справочно; отведена 15.10 — размер входил только через выбор зоны, "
+              f"№72): {s['pillar3']:+.0f}" + ("; без крупнейшего счёта зоны " +
+                                             ", ".join(f"{n} {v:+.0f}" for n, v in alt) if alt else ""))
     if s.get("cum"):
         c = s["cum"]
         lim = " / ".join(str(k) for k in CUM_K)
@@ -408,16 +462,37 @@ def print_summary(s: dict, top) -> None:
         print(f"Кумулятивная версия (доля стороны со стопами в пределах {lim} дн. ходов; плюс — шорты):")
         print(f"   шорты {f('short')}, лонги {f('long')} → {v}   "
               f"(база: шорты ${s['short_usd'] / 1e6:,.0f} млн, лонги ${s['long_usd'] / 1e6:,.0f} млн)")
-        if s["pillar3"] is not None:
-            diff = [str(k) for k in CUM_K if c[str(k)]["value"] is not None and s["pillar3"] != 0
-                    and (c[str(k)]["value"] > 0) != (s["pillar3"] > 0)]
+        if s.get("d"):
+            diff = [str(k) for k in CUM_K if c[str(k)]["value"] is not None
+                    and (c[str(k)]["value"] > 0) != (s["d"] > 0)]
             if diff:
-                print(f"   [!] Знак расходится с зонной версией в пределах {', '.join(diff)} дн. ходов — "
+                print(f"   [!] Знак расходится с D в пределах {', '.join(diff)} дн. ходов — "
                       f"печатается расхождение, версия не выбирается")
-    if s.get("pillar3_vol") is not None:
-        print(f"Вариант B ({B_NOTE}): шортов ${s['exp_up_usd'] / 1e6:,.1f} млн, "
-              f"лонгов ${s['exp_down_usd'] / 1e6:,.1f} млн → {s['pillar3_vol']:+.0f}")
     print("   Выборка: крупнейшие счета Hyperliquid из таблицы лидеров и HLP. Не весь рынок.")
+
+
+def print_d(s: dict) -> None:
+    """Три линии столпа 3 (аудитор, 15.10): D — направление, T — величина, хрупкость."""
+    if s.get("d") is None:
+        print("\nСТОЛП 3 (D): открытого интереса в выборке нет — не считается")
+        return
+    base = s["oi_sample_usd"]
+    up, dn = 100 * s["r_up_usd"] / base, 100 * s["r_down_usd"] / base
+    print(f"\nСТОЛП 3, версия D — ожидаемый объём принудительных закрытий за 7 дней, % от открытого "
+          f"интереса выборки (${base / 1e9:.2f} млрд):")
+    print(f"   стопы шортов (сверху): ${s['r_up_usd'] / 1e6:,.1f} млн = {up:.2f}%;   "
+          f"стопы лонгов (снизу): ${s['r_down_usd'] / 1e6:,.1f} млн = {dn:.2f}%")
+    print(f"   D (направление) = {up:.2f} − {dn:.2f} = {s['d']:+.2f}   — плюс: уязвимее шорты (цена скорее "
+          f"прыгнет вверх к их стопам); минус — лонги (вниз сквозь их стопы). Входит в индекс.")
+    print(f"   T (величина риска) = {up:.2f} + {dn:.2f} = {s['t']:.2f}   — сколько выборки под угрозой "
+          f"в обе стороны; в индекс не входит.")
+    if s.get("d_wo_top") is not None:
+        same = (s["d_wo_top"] > 0) == (s["d"] > 0) and s["d_wo_top"] != 0
+        side = "шортов" if s["d_lead"] == "short" else "лонгов"
+        print(f"   Хрупкость: без крупнейшего счёта стороны знака ({side}; позиция "
+              f"${s['d_top_usd'] / 1e6:,.1f} млн, {100 * s['d_top_share']:.0f}% ожидаемого объёма стороны) "
+              f"D = {s['d_wo_top']:+.2f} — " + ("знак сохраняется" if same else "[!] знак меняется"))
+    print("   " + D_LIMIT)
 
 
 def print_hlp(rows: list, oi: float, mark: float) -> None:
@@ -455,7 +530,7 @@ def stability(positions: list[dict], oi: float, mark: float, sigma: float, curve
     elif any(p["rank"] < 0 for p in positions):
         print("   (позиции HLP входят во все строки)")
     print(f"   {'выборка':>16}{'покр. Л/Ш':>12}{'шорты: зона, P7':>20}{'лонги: зона, P7':>20}"
-          f"{'столп 3':>9}{'вар. B':>8}")
+          f"{'зонная':>8}{'D':>8}{'T':>7}")
     n = len(positions)
     variants = ([(f"топ {c}", [p for p in positions if p["rank"] < c]) for c in cuts] if have_rank
                 else [(f"{q}% позиций", positions[: max(1, n * q // 100)]) for q in (25, 50, 100)])
@@ -465,9 +540,10 @@ def stability(positions: list[dict], oi: float, mark: float, sigma: float, curve
         z = summarize(sub, oi, mark, sigma, curve, sens=False)
         f = lambda w: f"{w['dist_pct']:+.1f}%, {100 * w['p7']:.0f}%" if w else "—"
         p3 = "—" if z["pillar3"] is None else f"{z['pillar3']:+.0f}"
-        pv = "—" if z["pillar3_vol"] is None else f"{z['pillar3_vol']:+.0f}"
+        dv = "—" if z["d"] is None else f"{z['d']:+.2f}"
+        tv = "—" if z["t"] is None else f"{z['t']:.2f}"
         print(f"   {name:>16}{100 * z['cover_long']:>6.0f}/{100 * z['cover_short']:<5.0f}"
-              f"{f(z['short']):>20}{f(z['long']):>20}{p3:>9}{pv:>8}")
+              f"{f(z['short']):>20}{f(z['long']):>20}{p3:>8}{dv:>8}{tv:>7}")
     print("   Если строки похожи — меньшая выборка даёт ту же картину, и неполное")
     print("   покрытие, скорее всего, картину не искажает. Если расходятся — искажает.")
 
@@ -684,7 +760,11 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
             **{f"cum{k}_{side}": f((c.get(str(k)) or {}).get(side), 5)
                for k in CUM_K for side in ("short", "long")},
             **{f"near{t}_{side}": f(_near(s, side, t), 0) for t in (2, 5, 10) for side in ("short", "long")},
-            "mark": f(s.get("mark"), 1), "oi_btc": f(s.get("oi_btc"), 2), "instrument": "Hyperliquid"}
+            "mark": f(s.get("mark"), 1), "oi_btc": f(s.get("oi_btc"), 2), "instrument": "Hyperliquid",
+            "d": f(s.get("d")), "t": f(s.get("t")), "d_wo_top": f(s.get("d_wo_top")),
+            "d_lead": s.get("d_lead") or "", "d_top_share": f(s.get("d_top_share")),
+            "r_up_usd": f(s.get("r_up_usd"), 0), "r_down_usd": f(s.get("r_down_usd"), 0),
+            "oi_sample_usd": f(s.get("oi_sample_usd"), 0)}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -768,10 +848,10 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
     if sig_src:
         _append_csv(os.path.join(out, "pillar3_daily.csv"),
                     pillar_row(stamp, mode, summary, sig_src, n), P3_COLS)
-        print(f"Столп 3 = {summary['pillar3']:+.1f}" if summary["pillar3"] is not None else "Столп 3: зоны нет",
-              f"(σ {100 * summary['sigma']:.2f}%, Coinbase); кумулятивная 1/2/4:",
-              " / ".join("—" if summary["cum"][str(k)]["value"] is None else f"{summary['cum'][str(k)]['value']:+.0f}"
-                         for k in CUM_K))
+        sm = summary
+        print(f"Столп 3: D = {sm['d']:+.2f}, T = {sm['t']:.2f}" if sm.get("d") is not None else "Столп 3: D нет",
+              f"(σ {100 * sm['sigma']:.2f}%, Coinbase); зонная (справочно)",
+              "—" if sm["pillar3"] is None else f"{sm['pillar3']:+.1f}")
     _append_log(os.path.join(out, "hl_log.csv"), {
         "utc": stamp, "kind": mode, "polled": n, "positions": len(pos), "errors": P["errors"],
         "minutes": f"{P['minutes']:.1f}", "cover_long": f"{L / P['oi']:.4f}",
@@ -872,8 +952,9 @@ def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> tuple:
         head += f"; прежние держатели от {k['utc']} ({len(ks)} счетов)"
     sets.append((f"топ {top}", [p for p in pos if p["rank"] < top]))
     print(head + "\n")
-    print(f"   {'выборка':<56}{'позиций':>8}{'покр. Л/Ш':>11}{'шорты: зона':>13}{'лонги: зона':>13}"
-          f"{'столп 3':>8}{'в 2/5/10%, $ млн: шорты | лонги':>36}{'кум. 1/2/4σ':>16}")
+    print(f"   {'выборка':<56}{'позиций':>8}{'покр. Л/Ш':>11}{'D':>8}{'T':>7}{'D без топ':>10}"
+          f"{'шорты: зона':>13}{'лонги: зона':>13}{'зонная':>8}{'в 2/5/10%, $ млн: шорты | лонги':>36}"
+          f"{'кум. 1/2/4σ':>16}")
     for name, sub in sets:
         z = summarize(sub, s0["oi_btc"], s0["mark"], s0["sigma"], curve, sens=False)
         zs = lambda w: f"{w['dist_pct']:+.1f}%" if w else "—"
@@ -881,9 +962,12 @@ def depth(snap_path: str, known_path_arg: str, top: int = 2000) -> tuple:
         cum = "/".join("—" if z["cum"][str(kk)]["value"] is None else f"{z['cum'][str(kk)]['value']:+.0f}"
                        for kk in CUM_K)
         p3 = "—" if z["pillar3"] is None else f"{z['pillar3']:+.1f}"
+        num = lambda v, fmt: "—" if v is None else format(v, fmt)
         print(f"   {name:<56}{len(sub):>8}{100 * z['cover_long']:>6.0f}/{100 * z['cover_short']:<4.0f}"
+              f"{num(z['d'], '+.2f'):>8}{num(z['t'], '.2f'):>7}{num(z['d_wo_top'], '+.2f'):>10}"
               f"{zs(z['short']):>13}{zs(z['long']):>13}{p3:>8}{near('short') + ' | ' + near('long'):>36}{cum:>16}")
-    print("\n   Строки ниже эталона сравниваются с ним: совпадают — состав годен.")
+    print("\n   Строки ниже эталона сравниваются с ним: совпадают — состав годен. Главная колонка — D "
+          "(сдвиг D с глубиной выборки — условие приёмки, аудитор 15.10).")
     return snap_path, known_path_arg
 
 
@@ -968,6 +1052,98 @@ def recompute(path: str) -> None:
               cuts_for(span) if span else None)
 
 
+def cutoffs(path: str) -> list:
+    """
+    Чувствительность D к обрезке 6 / 8 / 12σ — один прогон, больше не повторять
+    (аудитор, 15.10). Кривая вероятностей есть до 8σ; для 8–12σ две границы:
+    вероятность как в 8σ (кривая убывает — это верхняя) и ноль (нижняя).
+    """
+    snap, s0, curve = _load_snap(path)
+    pos = [p for p in snap["positions"] if p["liq"] is not None and p["liq"] > 0]
+    mark, sig = s0["mark"], s0["sigma"]
+    rows = [(100.0 * (p["liq"] / mark - 1.0), abs(p["szi"]) * mark, i) for i, p in enumerate(pos)]
+    oi_s = sum(abs(p["szi"]) for p in snap["positions"]) * mark
+    print(f"Снимок {snap['utc']} UTC: D при разной обрезке (σ {100 * sig:.2f}%, OI выборки "
+          f"${oi_s / 1e9:.2f} млрд)")
+    band = {True: 0.0, False: 0.0}
+    for d, size, _ in rows:
+        if MT.K_MAX < _k(d, sig) <= max(CUTOFFS):
+            band[d > 0] += size
+    print(f"   стопы между 8σ и 12σ: шорты ${band[True] / 1e6:,.0f} млн, лонги ${band[False] / 1e6:,.0f} млн "
+          f"(до {100 * (math.exp(12 * sig) - 1):.0f}% вверх / {100 * (1 - math.exp(-12 * sig)):.0f}% вниз)")
+    print(f"   {'обрезка':<34}{'R↑, $ млн':>11}{'R↓, $ млн':>11}{'D':>8}{'T':>7}{'D без топ':>10}")
+    out = []
+    for kmax in CUTOFFS:
+        for tail in (("flat", "zero") if kmax > curve["k"][-1] else ("flat",)):
+            R, contrib = expected_closures(rows, sig, curve, k_max=kmax, tail=tail)
+            b = d_block(R, contrib, oi_s)
+            name = f"{kmax:g}σ" + ("" if kmax <= curve["k"][-1] else
+                                    ", за 8σ — как в 8σ (верхняя)" if tail == "flat" else ", за 8σ — ноль (нижняя)")
+            wo = "—" if b["d_wo_top"] is None else f"{b['d_wo_top']:+.2f}"
+            print(f"   {name:<34}{R[True] / 1e6:>11,.1f}{R[False] / 1e6:>11,.1f}{b['d']:>+8.2f}{b['t']:>7.2f}{wo:>10}")
+            out.append((kmax, tail, b))
+    print("   Один прогон для записи (аудитор, 15.10); обрезка остаётся 8σ.")
+    return out
+
+
+def find_snapshot(utc: str, kind: str, out: str = DATA_DIR) -> str | None:
+    """Снимок по метке ряда: data/hl/ГГГГ/ММ/ (репозиторий) или hl_snapshots/ (ноутбук)."""
+    names = [f"hl_{utc}_{kind}.json.gz", f"hl_{utc}.json", f"hl_{utc}_{kind}.json"]
+    for d in (os.path.join(out, "hl", utc[:4], utc[4:6]), SNAP_DIR):
+        for n in names:
+            if os.path.isfile(os.path.join(d, n)):
+                return os.path.join(d, n)
+    return None
+
+
+def refill(csv_path: str | None = None, out: str = DATA_DIR) -> int:
+    """
+    Дописать в ряд столпа 3 колонки, которых не было, когда строка писалась
+    (например D и T до 15.10), — по сохранённому снимку и σ ИЗ САМОЙ СТРОКИ.
+    Заполненные значения не трогаются; зонная версия пересчитывается для сверки:
+    не совпала — строка не дописывается.
+    """
+    csv_path = csv_path or os.path.join(out, "pillar3_daily.csv")
+    with open(csv_path, encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    curve = MT.load_curve(os.path.join(HERE, "p3_touch_curve.csv"))
+    n_fill = 0
+    for r in rows:
+        empty = [c for c in P3_COLS if not r.get(c)]
+        if not empty or not r.get("sigma"):
+            continue
+        path = find_snapshot(r["utc"], r["kind"], out)
+        if path is None:
+            print(f"   {r['utc']}: снимка нет — пропуск")
+            continue
+        snap = _read_snap(path)
+        s0 = snap["summary"]
+        sig = s0.get("sigma") or float(r["sigma"])         # в облачном снимке σ полной точности
+        if abs(sig - float(r["sigma"])) > 6e-6:
+            print(f"   [!] {r['utc']}: σ снимка {sig:.5f} не совпадает со строкой {r['sigma']} — пропуск")
+            continue
+        s = summarize(snap["positions"], s0["oi_btc"], s0["mark"], sig, curve)
+        new = pillar_row(r["utc"], r["kind"], s, r.get("sigma_src", ""), r.get("polled", ""))
+        if (r.get("pillar3") or "") != new["pillar3"] and not (
+                r.get("pillar3") and new["pillar3"] and abs(float(new["pillar3"]) - float(r["pillar3"])) <= 0.011):
+            print(f"   [!] {r['utc']}: зонная версия не воспроизводится ({r['pillar3']} против {new['pillar3']}) — "
+                  f"строка не дописана")
+            continue
+        filled = [c for c in empty if new.get(c) not in (None, "")]
+        for c in filled:
+            r[c] = new[c]
+        n_fill += bool(filled)
+        print(f"   {r['utc']}: дописано {len(filled)} колонок; D = {r.get('d') or '—'}, T = {r.get('t') or '—'}"
+              f" (зонная {r['pillar3']} воспроизведена)")
+    with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=P3_COLS, restval="")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in P3_COLS})
+    print(f"Ряд {os.path.basename(csv_path)}: строк {len(rows)}, дописано {n_fill}")
+    return n_fill
+
+
 def widths(path: str) -> None:
     """Чувствительность зоны к ширине окна — один раз, для записи (аудитор, 11.10)."""
     snap, s0, curve = _load_snap(path)
@@ -1047,6 +1223,25 @@ def selftest() -> None:
     dn = 2 * 84000 * rw(81000, False)                                       # 70 000 — дальше 8 ходов
     assert abs(s["exp_up_usd"] / up - 1) < 0.03 and abs(s["exp_down_usd"] / dn - 1) < 0.03, (s, up, dn)
     assert abs(s["pillar3_vol"] - 100 * (up - dn) / (up + dn)) < 2
+    # Версия D (15.10): база — OI выборки (лонги 7 BTC, шорты 4 BTC, и без цены ликвидации тоже)
+    base = 11 * 84000.0
+    assert abs(s["oi_sample_usd"] - base) < 1e-6
+    assert abs(s["d"] - 100 * (s["r_up_usd"] - s["r_down_usd"]) / base) < 1e-9
+    assert abs(s["d"] - 100 * (up - dn) / base) < 0.03 * abs(s["d"]) and abs(s["t"] - 100 * (up + dn) / base) < 0.03 * s["t"]
+    assert abs(s["d"] / s["t"] * 100 - s["pillar3_vol"]) < 1e-9 and s["d"] > 0
+    # Хрупкость: закрытая формула = честный пересчёт без крупнейшего счёта стороны знака (шорт 3 BTC)
+    assert s["d_lead"] == "short" and abs(s["d_top_usd"] - 3 * 84000) < 1e-6
+    rest = [q for q in pos if q["liq"] != 86000.0]
+    assert abs(summarize(rest, 10.0, 84000.0, 0.02, curve)["d"] - s["d_wo_top"]) < 1e-9
+    # Приёмочные свойства (прогон 15.10): размер входит, двусторонний риск виден в T
+    near = lambda x: summarize(pos + [{"szi": -x, "liq": 84000 * 1.004}], 10.0, 84000.0, 0.02, curve)
+    assert near(50.0)["d"] > near(5.0)["d"] > s["d"]                        # зонная дала бы одно и то же
+    both = summarize(pos + [{"szi": -20.0, "liq": 84000 * 1.01}, {"szi": 20.0, "liq": 84000 / 1.01}],
+                     10.0, 84000.0, 0.02, curve)
+    assert abs(both["d"]) < abs(s["d"]) and both["t"] > 2 * s["t"]
+    # Стопы дальше обрезки — только в базе: D сжимается в отношении баз, R не меняются
+    far = summarize(pos + [{"szi": -11.0, "liq": 84000 * 1.5}], 10.0, 84000.0, 0.02, curve)
+    assert far["r_up_usd"] == s["r_up_usd"] and abs(far["d"] - s["d"] / 2) < 1e-9
     # Кумулятивная версия: шорты 4 BTC (3 в 1,18 хода, 1 в 6,2), лонги 7 BTC
     # (2 в 1,82 хода, 4 дальше 8, 1 без цены ликвидации) — нормировка на всю сторону
     c = s["cum"]
@@ -1212,6 +1407,24 @@ def selftest() -> None:
         assert abs(float(r2["short_usd"]) - dm["summary"]["short_usd"]) < 1
         assert abs(float(r2["cum2_short"]) - c2["2"]["short"]) < 1e-4 and r2["instrument"] == "Hyperliquid"
         assert r2["near10_long"] != "" and r2["zone_short_lo"] != "" and r2["k_short"] != ""
+        assert abs(float(r2["d"]) - dm["summary"]["d"]) < 1e-4 and r2["t"] != "" and r2["d_lead"] in ("short", "long")
+        assert abs(float(r2["oi_sample_usd"]) - dm["summary"]["oi_sample_usd"]) < 1
+        # Дозаполнение: строки без колонок D — по снимку и σ из строки; строка без снимка — пропуск
+        p3csv = os.path.join(tmp, "p3_refill.csv")
+        dcols = ["d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd"]
+        with open(p3csv, "w", encoding="utf-8", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=[c for c in P3_COLS if c not in dcols])
+            w.writeheader()
+            for r in pr:
+                w.writerow({k: v for k, v in r.items() if k not in dcols})
+        print("\n--- дозаполнение ряда (D, T) по сохранённым снимкам ---")
+        assert refill(p3csv, out) == 2
+        with open(p3csv, encoding="utf-8") as fh:
+            rf = list(csv.DictReader(fh))
+        assert rf[0]["d"] == "" and rf[0]["pillar3"] == pr[0]["pillar3"]                    # снимка нет
+        for a_, b_ in zip(rf[1:], pr[1:]):
+            assert all(a_[c] == b_[c] for c in P3_COLS), [c for c in P3_COLS if a_[c] != b_[c]]
+        assert refill(p3csv, out) == 0                                                     # повтор — ничего
         # «Ноутбук»: забрать снимки из «облака» и посчитать столп по последнему
         tree = {"tree": [{"type": "blob",
                           "path": os.path.relpath(os.path.join(dp, f), tmp).replace(os.sep, "/")}
@@ -1228,6 +1441,13 @@ def selftest() -> None:
         assert snap_m["kind"] == "daily" and s0["sigma"] is not None
         print("\n--- ноутбук: столп 3 по последнему облачному снимку ---")
         recompute("latest")
+        print("\n--- ноутбук: обрезка 6/8/12σ ---")
+        cuts = cutoffs("latest")
+        sl = summarize(snap_m["positions"], s0["oi_btc"], s0["mark"], s0["sigma"],
+                       MT.load_curve(os.path.join(tmp, "p3_touch_curve.csv")))
+        b = {(k_, t_): v_ for k_, t_, v_ in cuts}
+        assert abs(b[(8.0, "flat")]["d"] - sl["d"]) < 1e-9 and abs(b[(12.0, "zero")]["d"] - sl["d"]) < 1e-9
+        assert b[(6.0, "flat")]["t"] <= b[(8.0, "flat")]["t"] <= b[(12.0, "flat")]["t"]
         # Прежний список держателей при обновлении из облака сохраняется — для проверки глубины
         with open(os.path.join(tmp, "hl_known.json"), "w", encoding="utf-8") as fh:
             json.dump({"utc": "20261011_2209", "addresses": sorted(holders)}, fh)
@@ -1305,7 +1525,9 @@ def selftest() -> None:
           "облачный сборщик (полный/ежедневный/повтор), забор на ноутбук, σ по закрытым дням, "
           "кумулятивная версия, проверка глубины (список, ранний полный снимок, пометка ежедневного состава), "
           "активность таблицы лидеров, "
-          "ежедневный режим с известными держателями")
+          "ежедневный режим с известными держателями, версия D (база — OI выборки, хрупкость = честный "
+          "пересчёт, размер входит, двусторонний риск в T, дальние стопы только в базе), обрезка 6/8/12σ, "
+          "дозаполнение ряда по снимкам")
 
 
 def main() -> None:
@@ -1319,8 +1541,11 @@ def main() -> None:
     r.add_argument("--workers", type=int, default=WORKERS)
     r.add_argument("--known", action="store_true",
                    help="добавить держателей BTC из последнего полного опроса (ежедневный режим)")
-    for name in ("recompute", "widths"):
+    for name in ("recompute", "widths", "cutoffs"):
         sub.add_parser(name).add_argument("snapshot", help="путь к снимку или latest — последний")
+    rf = sub.add_parser("refill", help="дописать новые колонки ряда столпа 3 по сохранённым снимкам")
+    rf.add_argument("--csv", default=None, help="ряд (по умолчанию data/pillar3_daily.csv)")
+    rf.add_argument("--out", default=DATA_DIR)
     c = sub.add_parser("collect", help="облачный сборщик (GitHub Actions)")
     c.add_argument("--mode", dest="kind", choices=("auto", "daily", "full"), default="auto")
     c.add_argument("--top", type=int, default=2000)
@@ -1352,6 +1577,12 @@ def main() -> None:
         return
     if a.mode == "sigmacheck":
         sigmacheck()
+        return
+    if a.mode == "cutoffs":
+        cutoffs(a.snapshot)
+        return
+    if a.mode == "refill":
+        refill(a.csv, a.out)
         return
     if a.mode == "selftest":
         selftest()
