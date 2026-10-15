@@ -112,7 +112,10 @@ P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", 
            "near2_short", "near5_short", "near10_short", "near2_long", "near5_long", "near10_long",
            "mark", "oi_btc", "instrument",
            # версия D (15.10): направление, величина, хрупкость, суммы сторон, база
-           "d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd"]
+           "d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd",
+           # лестница глубин (аудитор, 15.10 вечер): D и T по ступеням, знак — при согласии всех ступеней
+           "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder"]
+LADDER = (2000, 10000, 20000)               # ступени лестницы глубин; последняя ступень — все опрошенные
 CUTOFFS = (6.0, 8.0, 12.0)                  # чувствительность D к обрезке — один прогон (аудитор, 15.10)
 D_LIMIT = ("Ограничение: D — ожидаемый объём при обычном распределении цены; каскад (ликвидации "
            "сами двигают цену дальше) не учтён — в каскаде D занижает риск. Высокий T — топливо для каскада.")
@@ -422,6 +425,42 @@ def summarize(positions: list[dict], oi: float, mark: float, sigma: float,
     return out
 
 
+def ladder(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict,
+           whole: dict | None = None) -> dict | None:
+    """
+    Лестница глубин (аудитор, 15.10 вечер): D и T по крупнейшим N счетам таблицы
+    лидеров (HLP — во всех ступенях) и по всем опрошенным. Знак D УСТАНОВЛЕН,
+    только если он одинаков на всех ступенях, где D есть; иначе «нет». Порога нет.
+    В ежедневном снимке ступени выше 2000 — держатели из полного опроса с этим рангом.
+    """
+    if not positions or not all("rank" in p for p in positions):
+        return None
+    steps = {}
+    for n in LADDER:
+        sub = [p for p in positions if p["rank"] < n]
+        z = summarize(sub, oi, mark, sigma, curve, sens=False) if sub else {}
+        steps[str(n)] = {"d": z.get("d"), "t": z.get("t"), "n": len(sub)}
+    w = whole or summarize(positions, oi, mark, sigma, curve, sens=False)
+    steps["all"] = {"d": w.get("d"), "t": w.get("t"), "n": len(positions)}
+    sg = {(v["d"] > 0) - (v["d"] < 0) for v in steps.values() if v["d"] is not None}
+    sign = ("+" if 1 in sg else "-") if len(sg) == 1 and 0 not in sg else "нет"
+    return {"steps": steps, "sign": sign}
+
+
+def print_ladder(lad: dict | None) -> None:
+    if not lad:
+        print("Лестница глубин: в снимке нет ранга счёта — не считается")
+        return
+    st = lad["steps"]
+    cells = " / ".join("—" if st[k]["d"] is None else f"{st[k]['d']:+.2f}" for k in st)
+    names = " / ".join(("все" if k == "all" else f"{int(k):,}".replace(",", " ")) for k in st)
+    verdict = {"+": "одинаков на всех ступенях: плюс — знак установлен",
+               "-": "одинаков на всех ступенях: минус — знак установлен"}.get(lad["sign"], "разный — знак НЕ установлен")
+    print(f"Лестница глубин D ({names}): {cells} — {verdict}")
+    print("   Уровни D и T — свойства таблицы лидеров и не сопоставимы ни с чем вне неё; ряд внутри себя "
+          "сопоставим (состав постоянен); знак пригоден там, где устойчив к глубине (аудитор, 15.10).")
+
+
 def print_summary(s: dict, top) -> None:
     print(f"\nHYPERLIQUID, BTC — цена {s['mark']:,.0f}; открытый интерес {s['oi_btc']:,.0f} BTC "
           f"(${s['oi_btc'] * s['mark'] / 1e9:.2f} млрд)")
@@ -546,6 +585,8 @@ def stability(positions: list[dict], oi: float, mark: float, sigma: float, curve
               f"{f(z['short']):>20}{f(z['long']):>20}{p3:>8}{dv:>8}{tv:>7}")
     print("   Если строки похожи — меньшая выборка даёт ту же картину, и неполное")
     print("   покрытие, скорее всего, картину не искажает. Если расходятся — искажает.")
+    if have_rank:
+        print_ladder(ladder(positions, oi, mark, sigma, curve))
 
 
 def fetch_one(rank_addr):
@@ -764,7 +805,10 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
             "d": f(s.get("d")), "t": f(s.get("t")), "d_wo_top": f(s.get("d_wo_top")),
             "d_lead": s.get("d_lead") or "", "d_top_share": f(s.get("d_top_share")),
             "r_up_usd": f(s.get("r_up_usd"), 0), "r_down_usd": f(s.get("r_down_usd"), 0),
-            "oi_sample_usd": f(s.get("oi_sample_usd"), 0)}
+            "oi_sample_usd": f(s.get("oi_sample_usd"), 0),
+            **{f"{k}_l{n}": f(((s.get("ladder") or {}).get("steps", {}).get(str(n)) or {}).get(k))
+               for k in ("d", "t") for n in LADDER},
+            "d_sign_ladder": (s.get("ladder") or {}).get("sign", "")}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -817,7 +861,9 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
     try:
         sigma = sigma_at(_cb_daily(), stamp_ms(stamp))
         if sigma and os.path.isfile(cpath):
-            summary = summarize(pos, P["oi"], P["mark"], sigma, MT.load_curve(cpath))
+            curve = MT.load_curve(cpath)
+            summary = summarize(pos, P["oi"], P["mark"], sigma, curve)
+            summary["ladder"] = ladder(pos, P["oi"], P["mark"], sigma, curve, whole=summary)
             sig_src = summary["sigma_src"] = "coinbase"
     except Exception as exc:                              # noqa: BLE001
         print(f"[!] Столп 3 в облаке не посчитан ({str(exc)[:80]}) — посчитает ноутбук")
@@ -852,6 +898,7 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
         print(f"Столп 3: D = {sm['d']:+.2f}, T = {sm['t']:.2f}" if sm.get("d") is not None else "Столп 3: D нет",
               f"(σ {100 * sm['sigma']:.2f}%, Coinbase); зонная (справочно)",
               "—" if sm["pillar3"] is None else f"{sm['pillar3']:+.1f}")
+        print_ladder(sm.get("ladder"))
     _append_log(os.path.join(out, "hl_log.csv"), {
         "utc": stamp, "kind": mode, "polled": n, "positions": len(pos), "errors": P["errors"],
         "minutes": f"{P['minutes']:.1f}", "cover_long": f"{L / P['oi']:.4f}",
@@ -1123,6 +1170,7 @@ def refill(csv_path: str | None = None, out: str = DATA_DIR) -> int:
             print(f"   [!] {r['utc']}: σ снимка {sig:.5f} не совпадает со строкой {r['sigma']} — пропуск")
             continue
         s = summarize(snap["positions"], s0["oi_btc"], s0["mark"], sig, curve)
+        s["ladder"] = ladder(snap["positions"], s0["oi_btc"], s0["mark"], sig, curve, whole=s)
         new = pillar_row(r["utc"], r["kind"], s, r.get("sigma_src", ""), r.get("polled", ""))
         if (r.get("pillar3") or "") != new["pillar3"] and not (
                 r.get("pillar3") and new["pillar3"] and abs(float(new["pillar3"]) - float(r["pillar3"])) <= 0.011):
@@ -1239,6 +1287,13 @@ def selftest() -> None:
     both = summarize(pos + [{"szi": -20.0, "liq": 84000 * 1.01}, {"szi": 20.0, "liq": 84000 / 1.01}],
                      10.0, 84000.0, 0.02, curve)
     assert abs(both["d"]) < abs(s["d"]) and both["t"] > 2 * s["t"]
+    # Лестница: знак установлен только при согласии ступеней
+    rk = lambda first: [dict(q, rank=0 if q["liq"] == first else 30000 + i) for i, q in enumerate(pos)]
+    lz = ladder(rk(81000.0), 10.0, 84000.0, 0.02, curve)                   # в топе только лонг у цены
+    assert lz["steps"]["2000"]["n"] == 1 and lz["steps"]["all"]["n"] == len(pos)
+    assert lz["steps"]["2000"]["d"] < 0 < lz["steps"]["all"]["d"] and lz["sign"] == "нет"
+    assert ladder(rk(86000.0), 10.0, 84000.0, 0.02, curve)["sign"] == "+"   # в топе шорт — плюс везде
+    assert ladder([{"szi": 1.0, "liq": 80000.0}], 10.0, 84000.0, 0.02, curve) is None     # без ранга
     # Стопы дальше обрезки — только в базе: D сжимается в отношении баз, R не меняются
     far = summarize(pos + [{"szi": -11.0, "liq": 84000 * 1.5}], 10.0, 84000.0, 0.02, curve)
     assert far["r_up_usd"] == s["r_up_usd"] and abs(far["d"] - s["d"] / 2) < 1e-9
@@ -1409,9 +1464,15 @@ def selftest() -> None:
         assert r2["near10_long"] != "" and r2["zone_short_lo"] != "" and r2["k_short"] != ""
         assert abs(float(r2["d"]) - dm["summary"]["d"]) < 1e-4 and r2["t"] != "" and r2["d_lead"] in ("short", "long")
         assert abs(float(r2["oi_sample_usd"]) - dm["summary"]["oi_sample_usd"]) < 1
+        lad = dm["summary"]["ladder"]                                      # лестница: последняя ступень = весь снимок
+        assert lad["steps"]["all"]["d"] == dm["summary"]["d"] and r2["d_sign_ladder"] == lad["sign"]
+        assert lad["sign"] in ("+", "-", "нет") and r2["d_l2000"] != "" and r2["t_l20000"] != ""
+        sg = {(v["d"] > 0) - (v["d"] < 0) for v in lad["steps"].values() if v["d"] is not None}
+        assert (lad["sign"] != "нет") == (len(sg) == 1 and 0 not in sg)
         # Дозаполнение: строки без колонок D — по снимку и σ из строки; строка без снимка — пропуск
         p3csv = os.path.join(tmp, "p3_refill.csv")
-        dcols = ["d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd"]
+        dcols = ["d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd",
+                 "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder"]
         with open(p3csv, "w", encoding="utf-8", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=[c for c in P3_COLS if c not in dcols])
             w.writeheader()
@@ -1527,7 +1588,7 @@ def selftest() -> None:
           "активность таблицы лидеров, "
           "ежедневный режим с известными держателями, версия D (база — OI выборки, хрупкость = честный "
           "пересчёт, размер входит, двусторонний риск в T, дальние стопы только в базе), обрезка 6/8/12σ, "
-          "дозаполнение ряда по снимкам")
+          "дозаполнение ряда по снимкам, лестница глубин (знак — при согласии ступеней)")
 
 
 def main() -> None:
