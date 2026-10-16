@@ -234,7 +234,12 @@ def run(refresh: bool) -> None:
 # Самопроверка
 # --------------------------------------------------------------------------
 
+SYNTH = ("САМОПРОВЕРКА: ЧИСЛА НИЖЕ ПОДСТАВНЫЕ (синтетические данные) — к рынку отношения не имеют, "
+         "проверяется только механика")
+
+
 def selftest() -> None:
+    print(SYNTH + "\n")
     # Теория: 2(1 − Φ(k/√n)); при k = 0 вероятность 1.
     assert abs(rw_prob(0.0, 7) - 1.0) < 1e-12
     assert abs(rw_prob(2.0, 4) - 2 * (1 - 0.8413447460685429)) < 1e-9
@@ -272,7 +277,7 @@ def selftest() -> None:
     per_k = [curve(rows2, 7, "k", K_GRID, 0, half), curve(rows2, 7, "k", K_GRID, half, None)]
     per_p = [curve(rows2, 7, "pct", PCT_GRID, 0, half), curve(rows2, 7, "pct", PCT_GRID, half, None)]
     assert era_spread(per_k, K_GRID) < era_spread(per_p, PCT_GRID), "шкала дневных ходов должна быть устойчивее"
-    print("selftest: OK — теория блуждания, касания, эмпирика против теории, "
+    print("selftest: OK (числа подставные) — теория блуждания, касания, эмпирика против теории, "
           "устойчивость шкалы дневных ходов при смене волатильности")
 
 

@@ -198,7 +198,12 @@ def run() -> None:
 # Самопроверка
 # --------------------------------------------------------------------------
 
+SYNTH = ("САМОПРОВЕРКА: ЧИСЛА НИЖЕ ПОДСТАВНЫЕ (синтетические данные) — к рынку отношения не имеют, "
+         "проверяется только механика")
+
+
 def selftest() -> None:
+    print(SYNTH + "\n")
     ks, ps = [0.25, 1.0, 2.0], [0.9, 0.7, 0.4]
     assert abs(interp(ks, ps, 0.0) - 1.0) < 1e-12 and abs(interp(ks, ps, 1.5) - 0.55) < 1e-12
     assert interp(ks, ps, 5.0) == 0.4
@@ -226,7 +231,7 @@ def selftest() -> None:
     recs = evaluate(rows, zones, curve, start="1970-01-01")
     obs, exp = sum(r["touched"] for r in recs), sum(r["expected"] for r in recs)
     assert 0.85 < obs / exp < 1.1, obs / exp
-    print(f"selftest: OK — кривая, зона, на случайном блуждании без магнита отношение {obs / exp:.2f}")
+    print(f"selftest: OK (числа подставные) — кривая, зона, на случайном блуждании без магнита отношение {obs / exp:.2f}")
 
 
 def main() -> None:
