@@ -114,9 +114,15 @@ P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", 
            # версия D (15.10): направление, величина, хрупкость, суммы сторон, база
            "d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd",
            # лестница глубин (аудитор, 15.10 вечер): D и T по ступеням, знак — при согласии всех ступеней
-           "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder"]
+           "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder",
+           # три состояния знака D и доли крупнейших вкладчиков сторон (аудитор, 16.10)
+           "d_state", "top_share_up", "top_share_down", "d_top_usd", "d_top_type", "d_top_lev",
+           "d_top_k", "d_top_dist", "d_top_rank"]
 LADDER = (2000, 10000, 20000)               # ступени лестницы глубин; последняя ступень — все опрошенные
 CUTOFFS = (6.0, 8.0, 12.0)                  # чувствительность D к обрезке — один прогон (аудитор, 15.10)
+# Три состояния знака D (аудитор, 16.10): лестница проверяет состав выборки, хрупкость —
+# концентрацию; ни одна не заменяет другую. Киты — предмет измерения: концентрацию называть.
+D_STATES = ("установлено", "одним счётом", "не установлено")
 D_LIMIT = ("Ограничение: D — ожидаемый объём при обычном распределении цены; каскад (ликвидации "
            "сами двигают цену дальше) не учтён — в каскаде D занижает риск. Высокий T — топливо для каскада.")
 
@@ -326,25 +332,34 @@ def expected_closures(rows: list, sigma: float, curve: dict, k_max: float | None
     законно, хотя события вложены (дойдя до 5σ, цена прошла и 1σ).
     За последней точкой кривой (8σ) вероятности нет: tail="flat" — как в 8σ
     (верхняя граница, кривая убывает), "zero" — ноль (нижняя граница).
-    Возвращает (R, вклады [(вклад, сторона, размер)]).
+    Возвращает (R, вклады [(вклад, сторона, размер, расстояние %, номер строки)]).
     """
     k_max = MT.K_MAX if k_max is None else k_max
     k_last = curve["k"][-1]
     R, contrib = {True: 0.0, False: 0.0}, []
-    for d, size, _ in rows:
+    for d, size, idx in rows:
         k = _k(d, sigma)
         if not 0 < k <= k_max or (tail == "zero" and k > k_last):
             continue
         c = size * MT.interp(curve["k"], curve[d > 0], k)
         R[d > 0] += c
-        contrib.append((c, d > 0, size))
+        contrib.append((c, d > 0, size, d, idx))
     return R, contrib
 
 
 def d_block(R: dict, contrib: list, oi_s: float) -> dict:
-    """D, T и хрупкость D (без крупнейшего счёта стороны, что даёт знак)."""
+    """
+    D, T и хрупкость D (без крупнейшего счёта стороны, что даёт знак).
+    Доля крупнейшего вкладчика в R каждой стороны (аудитор, 16.10) — непрерывная мера:
+    широкое направление или единичное, не дожидаясь переворота знака.
+    """
     o = {"oi_sample_usd": oi_s, "r_up_usd": R[True], "r_down_usd": R[False],
-         "d": None, "t": None, "d_wo_top": None, "d_lead": None, "d_top_share": None, "d_top_usd": None}
+         "d": None, "t": None, "d_wo_top": None, "d_lead": None, "d_top_share": None, "d_top_usd": None,
+         "top_share_up": None, "top_share_down": None, "d_top_dist": None, "_top_idx": None}
+    for side, key in ((True, "top_share_up"), (False, "top_share_down")):
+        cs = [x[0] for x in contrib if x[1] == side]
+        if cs and R[side] > 0:
+            o[key] = max(cs) / R[side]
     if not oi_s:
         return o
     o["d"] = 100.0 * (R[True] - R[False]) / oi_s
@@ -352,7 +367,10 @@ def d_block(R: dict, contrib: list, oi_s: float) -> dict:
     if R[True] == R[False]:
         return o
     lead = R[True] > R[False]
-    c, _, size = max((x for x in contrib if x[1] == lead), key=lambda x: x[0])
+    top = max((x for x in contrib if x[1] == lead), key=lambda x: x[0])
+    c, size = top[0], top[2]
+    if len(top) > 4:
+        o["d_top_dist"], o["_top_idx"] = top[3], top[4]
     r = dict(R)
     r[lead] -= c
     rest = oi_s - size                      # счёт уходит и из базы
@@ -406,6 +424,11 @@ def summarize(positions: list[dict], oi: float, mark: float, sigma: float,
     tot = exp_vol[True] + exp_vol[False]
     out["pillar3_vol"] = 100.0 * (exp_vol[True] - exp_vol[False]) / tot if tot else None   # = D/T
     out.update(d_block(exp_vol, contrib, (L + S) * mark))
+    ti = out.pop("_top_idx", None)                          # счёт, что держит знак: плечо, маржа, ранг
+    if ti is not None:
+        tp = with_liq[ti]
+        out.update(d_top_type=tp.get("lev_type"), d_top_lev=tp.get("lev"), d_top_rank=tp.get("rank"),
+                   d_top_k=_k(out["d_top_dist"], sigma))
     # Кумулятивная версия (аудитор, 13.10): доля условной суммы стороны, чьи
     # ликвидации в пределах k дневных ходов от цены; нормировка — на всю сторону
     # в выборке (включая позиции без цены ликвидации). Без окна, сетки и максимума.
@@ -459,6 +482,54 @@ def print_ladder(lad: dict | None) -> None:
     print(f"Лестница глубин D ({names}): {cells} — {verdict}")
     print("   Уровни D и T — свойства таблицы лидеров и не сопоставимы ни с чем вне неё; ряд внутри себя "
           "сопоставим (состав постоянен); знак пригоден там, где устойчив к глубине (аудитор, 15.10).")
+
+
+def d_state(d, d_wo_top, sign_ladder) -> str | None:
+    """
+    Три состояния знака D (аудитор, 16.10; печать, не вето):
+      «установлено»   — лестница согласна и знак сохраняется без крупнейшего вкладчика стороны;
+      «одним счётом»  — лестница согласна, но без крупнейшего вкладчика знак другой (или ноль);
+      «не установлено» — ступени лестницы расходятся.
+    Когда знак у композита будет включён: первые два состояния знак дают, третье — нет.
+    """
+    if d is None or not sign_ladder:
+        return None
+    if sign_ladder not in ("+", "-"):
+        return D_STATES[2]
+    if d_wo_top is None or d_wo_top == 0 or (d_wo_top > 0) != (d > 0):
+        return D_STATES[1]
+    return D_STATES[0]
+
+
+def top_text(s: dict) -> str:
+    """Счёт, задающий знак: «изолированный лонг $149,9 млн, 40x, 1,05σ, 55% закрытий лонгов»."""
+    lg = s.get("d_lead") == "long"
+    kind = {"isolated": "изолированный ", "cross": "кросс-"}.get(s.get("d_top_type") or "", "")
+    lev = f", {s['d_top_lev']}x" if s.get("d_top_lev") else ""
+    k = f", {s['d_top_k']:.2f}σ до ликвидации" if s.get("d_top_k") is not None else ""
+    rank = s.get("d_top_rank")
+    rk = "" if rank is None else (", HLP" if rank < 0 else f", ранг {rank}")
+    return (f"{kind}{'лонг' if lg else 'шорт'} ${(s.get('d_top_usd') or 0) / 1e6:,.1f} млн{lev}{k}, "
+            f"{100 * (s.get('d_top_share') or 0):.0f}% ожидаемых закрытий {'лонгов' if lg else 'шортов'}{rk}")
+
+
+def print_state(s: dict) -> None:
+    """Направление D в трёх состояниях и доли крупнейших вкладчиков сторон (аудитор, 16.10)."""
+    lad = s.get("ladder")
+    st = d_state(s.get("d"), s.get("d_wo_top"), (lad or {}).get("sign"))
+    if st is None:
+        return
+    dirn = "вверх (уязвимее шорты)" if s["d"] > 0 else "вниз (уязвимее лонги)"
+    if st == D_STATES[0]:
+        print(f"Направление D: {dirn} — установлено (ступени согласны, без крупнейшего вкладчика знак тот же)")
+    elif st == D_STATES[1]:
+        print(f"Направление D: {dirn} — задано одним счётом: {top_text(s)}")
+    else:
+        print("Направление D: не установлено (ступени лестницы расходятся)")
+    f = lambda v: "—" if v is None else f"{100 * v:.0f}%"
+    print(f"   Доля крупнейшего вкладчика в ожидаемых закрытиях стороны: шорты {f(s.get('top_share_up'))}, "
+          f"лонги {f(s.get('top_share_down'))} (широкое направление или единичное; порога нет)")
+    print("   Лестница проверяет состав выборки, хрупкость — концентрацию; одна не заменяет другую.")
 
 
 def print_summary(s: dict, top) -> None:
@@ -808,7 +879,13 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
             "oi_sample_usd": f(s.get("oi_sample_usd"), 0),
             **{f"{k}_l{n}": f(((s.get("ladder") or {}).get("steps", {}).get(str(n)) or {}).get(k))
                for k in ("d", "t") for n in LADDER},
-            "d_sign_ladder": (s.get("ladder") or {}).get("sign", "")}
+            "d_sign_ladder": (s.get("ladder") or {}).get("sign", ""),
+            "d_state": d_state(s.get("d"), s.get("d_wo_top"), (s.get("ladder") or {}).get("sign")) or "",
+            "top_share_up": f(s.get("top_share_up")), "top_share_down": f(s.get("top_share_down")),
+            "d_top_usd": f(s.get("d_top_usd"), 0), "d_top_type": s.get("d_top_type") or "",
+            "d_top_lev": "" if s.get("d_top_lev") is None else s["d_top_lev"],
+            "d_top_k": f(s.get("d_top_k"), 3), "d_top_dist": f(s.get("d_top_dist"), 3),
+            "d_top_rank": "" if s.get("d_top_rank") is None else s["d_top_rank"]}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -899,6 +976,7 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
               f"(σ {100 * sm['sigma']:.2f}%, Coinbase); зонная (справочно)",
               "—" if sm["pillar3"] is None else f"{sm['pillar3']:+.1f}")
         print_ladder(sm.get("ladder"))
+        print_state(sm)
     _append_log(os.path.join(out, "hl_log.csv"), {
         "utc": stamp, "kind": mode, "polled": n, "positions": len(pos), "errors": P["errors"],
         "minutes": f"{P['minutes']:.1f}", "cover_long": f"{L / P['oi']:.4f}",
@@ -1097,6 +1175,8 @@ def recompute(path: str) -> None:
     span = snap.get("leaderboard") if snap.get("known_from") else top
     stability(snap["positions"], s0["oi_btc"], s0["mark"], s0["sigma"], curve,
               cuts_for(span) if span else None)
+    s["ladder"] = ladder(snap["positions"], s0["oi_btc"], s0["mark"], s0["sigma"], curve, whole=s)
+    print_state(s)
 
 
 def cutoffs(path: str) -> list:
@@ -1215,7 +1295,12 @@ def widths(path: str) -> None:
 # Самопроверка
 # --------------------------------------------------------------------------
 
+SYNTH = ("САМОПРОВЕРКА: ЧИСЛА НИЖЕ ПОДСТАВНЫЕ (синтетические данные) — к рынку отношения не имеют, "
+         "проверяется только механика")
+
+
 def selftest() -> None:
+    print(SYNTH + "\n")
     st = {"assetPositions": [
         {"position": {"coin": "ETH", "szi": "10", "entryPx": "3000", "liquidationPx": "2500",
                       "leverage": {"type": "cross", "value": 5}, "positionValue": "30000"}},
@@ -1281,6 +1366,16 @@ def selftest() -> None:
     assert s["d_lead"] == "short" and abs(s["d_top_usd"] - 3 * 84000) < 1e-6
     rest = [q for q in pos if q["liq"] != 86000.0]
     assert abs(summarize(rest, 10.0, 84000.0, 0.02, curve)["d"] - s["d_wo_top"]) < 1e-9
+    # Доли крупнейших вкладчиков сторон (аудитор, 16.10): у лонгов в пределах 8σ один счёт — 100%
+    assert s["top_share_down"] == 1.0 and abs(s["top_share_up"] - s["d_top_share"]) < 1e-12 < s["top_share_up"] < 1
+    assert abs(s["d_top_dist"] - 100 * (86000 / 84000 - 1)) < 1e-9 and abs(s["d_top_k"] - _k(s["d_top_dist"], 0.02)) < 1e-12
+    # Три состояния знака D: лестница — состав, хрупкость — концентрация
+    assert d_state(1.0, 0.5, "+") == "установлено" and d_state(-3.03, 0.35, "-") == "одним счётом"
+    assert d_state(-1.0, -0.5, "нет") == "не установлено" and d_state(1.0, 0.0, "+") == "одним счётом"
+    assert d_state(None, None, "+") is None and d_state(1.0, 0.5, "") is None
+    tt = top_text({"d_lead": "long", "d_top_type": "isolated", "d_top_lev": 40, "d_top_k": 1.05,
+                   "d_top_usd": 149.9e6, "d_top_share": 0.5515, "d_top_rank": 622})
+    assert tt == "изолированный лонг $149.9 млн, 40x, 1.05σ до ликвидации, 55% ожидаемых закрытий лонгов, ранг 622", tt
     # Приёмочные свойства (прогон 15.10): размер входит, двусторонний риск виден в T
     near = lambda x: summarize(pos + [{"szi": -x, "liq": 84000 * 1.004}], 10.0, 84000.0, 0.02, curve)
     assert near(50.0)["d"] > near(5.0)["d"] > s["d"]                        # зонная дала бы одно и то же
@@ -1469,10 +1564,16 @@ def selftest() -> None:
         assert lad["sign"] in ("+", "-", "нет") and r2["d_l2000"] != "" and r2["t_l20000"] != ""
         sg = {(v["d"] > 0) - (v["d"] < 0) for v in lad["steps"].values() if v["d"] is not None}
         assert (lad["sign"] != "нет") == (len(sg) == 1 and 0 not in sg)
+        sm_ = dm["summary"]                                                # три состояния и доли сторон
+        assert r2["d_state"] == d_state(sm_["d"], sm_["d_wo_top"], lad["sign"]) and r2["d_state"] in D_STATES
+        assert r2["top_share_up"] != "" and r2["top_share_down"] != "" and r2["d_top_type"] == "cross"
+        assert r2["d_top_lev"] in ("10", "5") and r2["d_top_k"] != "" and r2["d_top_rank"] != ""
         # Дозаполнение: строки без колонок D — по снимку и σ из строки; строка без снимка — пропуск
         p3csv = os.path.join(tmp, "p3_refill.csv")
         dcols = ["d", "t", "d_wo_top", "d_lead", "d_top_share", "r_up_usd", "r_down_usd", "oi_sample_usd",
-                 "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder"]
+                 "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder",
+                 "d_state", "top_share_up", "top_share_down", "d_top_usd", "d_top_type", "d_top_lev",
+                 "d_top_k", "d_top_dist", "d_top_rank"]
         with open(p3csv, "w", encoding="utf-8", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=[c for c in P3_COLS if c not in dcols])
             w.writeheader()
@@ -1581,14 +1682,15 @@ def selftest() -> None:
         g.update(saved)
         TC.load = saved_load
         shutil.rmtree(tmp, ignore_errors=True)
-    print("\nselftest: OK — разбор позиции, покрытие, скользящее окно (сетка ошиблась бы), равенство, "
+    print("\nselftest: OK (числа подставные) — разбор позиции, покрытие, скользящее окно (сетка ошиблась бы), равенство, "
           "хрупкость, вариант B, ограничитель, параллельный прогон, HLP, снимок, пересчёт, ширины, "
           "облачный сборщик (полный/ежедневный/повтор), забор на ноутбук, σ по закрытым дням, "
           "кумулятивная версия, проверка глубины (список, ранний полный снимок, пометка ежедневного состава), "
           "активность таблицы лидеров, "
           "ежедневный режим с известными держателями, версия D (база — OI выборки, хрупкость = честный "
           "пересчёт, размер входит, двусторонний риск в T, дальние стопы только в базе), обрезка 6/8/12σ, "
-          "дозаполнение ряда по снимкам, лестница глубин (знак — при согласии ступеней)")
+          "дозаполнение ряда по снимкам, лестница глубин (знак — при согласии ступеней), три состояния знака D "
+          "и доли крупнейших вкладчиков сторон")
 
 
 def main() -> None:
