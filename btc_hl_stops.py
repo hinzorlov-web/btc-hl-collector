@@ -571,8 +571,11 @@ def ladder(positions: list[dict], oi: float, mark: float, sigma: float, curve: d
     w = whole or summarize(positions, oi, mark, sigma, curve, sens=False)
     steps["all"] = {"d": w.get("d"), "t": w.get("t"), "n": len(positions)}
     sg = {(v["d"] > 0) - (v["d"] < 0) for v in steps.values() if v["d"] is not None}
-    sign = ("+" if 1 in sg else "-") if len(sg) == 1 and 0 not in sg else "нет"
-    return {"steps": steps, "sign": sign}
+    # Правило аудитора 17.10: запасной путь не даёт более уверенного исхода, чем основной. Ступень без D —
+    # не согласие, а нехватка данных: знак не устанавливается (раньше знак ставился по оставшимся ступеням).
+    full = all(v["d"] is not None for v in steps.values())
+    sign = ("+" if 1 in sg else "-") if full and len(sg) == 1 and 0 not in sg else "нет"
+    return {"steps": steps, "sign": sign, "complete": full}
 
 
 def print_ladder(lad: dict | None) -> None:
@@ -583,7 +586,9 @@ def print_ladder(lad: dict | None) -> None:
     cells = " / ".join("—" if st[k]["d"] is None else f"{st[k]['d']:+.2f}" for k in st)
     names = " / ".join(("все" if k == "all" else f"{int(k):,}".replace(",", " ")) for k in st)
     verdict = {"+": "одинаков на всех ступенях: плюс — знак установлен",
-               "-": "одинаков на всех ступенях: минус — знак установлен"}.get(lad["sign"], "разный — знак НЕ установлен")
+               "-": "одинаков на всех ступенях: минус — знак установлен"}.get(
+        lad["sign"], "разный — знак НЕ установлен" if lad.get("complete", True) else
+        "D посчитан не на всех ступенях — знак НЕ установлен")
     print(f"Лестница глубин D ({names}): {cells} — {verdict}")
     print("   Уровни D и T — свойства таблицы лидеров и не сопоставимы ни с чем вне неё; ряд внутри себя "
           "сопоставим (состав постоянен); знак пригоден там, где устойчив к глубине (аудитор, 15.10).")
@@ -608,6 +613,8 @@ def d_state(d, d_wo_top, sign_ladder) -> str | None:
 
 def top_text(s: dict) -> str:
     """Счёт, задающий знак: «изолированный лонг $149,9 млн, 40x, 1,05σ, 55% закрытий лонгов»."""
+    if s.get("d_lead") not in ("long", "short"):                # стороны нет — не угадывать (правило 17.10)
+        return "крупнейший счёт: сторона в строке не записана"
     lg = s.get("d_lead") == "long"
     kind = {"isolated": "изолированный ", "cross": "кросс-"}.get(s.get("d_top_type") or "", "")
     lev = f", {s['d_top_lev']}x" if s.get("d_top_lev") else ""
@@ -1830,6 +1837,17 @@ def selftest() -> None:
                          prev_snapshot(dec, "20261020_0010"))
         assert abs(same["d_pos"]) < 1e-12 and "t_px" not in same                     # состав тот же — только цена
         assert decompose(p1, 10.0, 81000.0, 0.021, cv, now_s["d"], now_s["t"], None) == {}
+        # Запасной путь не увереннее основного (аудитор, 17.10): ступень без D — знак не установлен
+        import contextlib
+        import io
+        assert top_text({"d_lead": None}) == "крупнейший счёт: сторона в строке не записана"
+        lad_ok = {"steps": {"2000": {"d": -1.0}, "all": {"d": -2.0}}, "sign": "-", "complete": True}
+        lad_gap = {"steps": {"2000": {"d": None}, "all": {"d": -2.0}}, "sign": "нет", "complete": False}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_ladder(lad_ok)
+            print_ladder(lad_gap)
+        assert "минус — знак установлен" in buf.getvalue() and "не на всех ступенях — знак НЕ установлен" in buf.getvalue()
     finally:
         g.update(saved)
         TC.load = saved_load
