@@ -67,6 +67,7 @@ import gzip
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -117,7 +118,14 @@ P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", 
            "d_l2000", "d_l10000", "d_l20000", "t_l2000", "t_l10000", "t_l20000", "d_sign_ladder",
            # три состояния знака D и доли крупнейших вкладчиков сторон (аудитор, 16.10)
            "d_state", "top_share_up", "top_share_down", "d_top_usd", "d_top_type", "d_top_lev",
-           "d_top_k", "d_top_dist", "d_top_rank"]
+           "d_top_k", "d_top_dist", "d_top_rank",
+           # аудитор, 17.10: разброс ФАКТИЧЕСКИХ цен входа (описательно, только открытые позиции — выжившие)
+           # и разложение изменения D и T к прошлым суткам: цена (вчерашний состав по сегодняшним цене и σ)
+           # + позиции (сегодняшний состав против вчерашнего по сегодняшней цене); сумма точна
+           "entry_disp", "entry_disp_long", "entry_disp_short", "entry_n",
+           "prev_utc", "prev_kind", "d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos"]
+ENTRY_NOTE = ("Разброс входов — только по ОТКРЫТЫМ позициям: закрытые и ликвидированные не видны, а это как раз "
+              "крайние входы, — наблюдаемый разброс УЖЕ настоящего (выжившие; аудитор, 17.10). Описательно, вне композита.")
 LADDER = (2000, 10000, 20000)               # ступени лестницы глубин; последняя ступень — все опрошенные
 CUTOFFS = (6.0, 8.0, 12.0)                  # чувствительность D к обрезке — один прогон (аудитор, 15.10)
 # Три состояния знака D (аудитор, 16.10): лестница проверяет состав выборки, хрупкость —
@@ -446,6 +454,103 @@ def summarize(positions: list[dict], oi: float, mark: float, sigma: float,
     out["cum"] = cum
     out["short_usd"], out["long_usd"] = side_tot[True], side_tot[False]
     return out
+
+
+def entry_disp(positions: list[dict]) -> dict:
+    """
+    Разброс фактических цен входа (аудитор, 17.10): взвешенное размером (BTC) стандартное отклонение
+    ln(цены входа) ×100 — ≈ % от цены, та же единица, что сырой разброс столпа 2. Все позиции снимка
+    (тот же состав, что у D), по сторонам и вместе. Только открытые позиции — выжившие (ENTRY_NOTE).
+    """
+    out = {"entry_n": 0}
+    for key, sel in (("entry_disp", lambda p: True), ("entry_disp_long", lambda p: p["szi"] > 0),
+                     ("entry_disp_short", lambda p: p["szi"] < 0)):
+        xs = [(abs(p["szi"]), math.log(p["entry"])) for p in positions
+              if sel(p) and p.get("szi") and (p.get("entry") or 0) > 0]
+        if key == "entry_disp":
+            out["entry_n"] = len(xs)
+        w = sum(a for a, _ in xs)
+        if len(xs) < 5 or w <= 0:                           # техническое минимальное число, не порог сигнала
+            out[key] = None
+            continue
+        m = sum(a * x for a, x in xs) / w
+        out[key] = 100.0 * math.sqrt(sum(a * (x - m) ** 2 for a, x in xs) / w)
+    return out
+
+
+def snap_day(utc: str) -> str:
+    """Сутки, к которым относится опрос: раньше 06:00 UTC — конец предыдущих (как btc_index.hl_day)."""
+    return (datetime.strptime(utc[:13], "%Y%m%d_%H%M") - timedelta(hours=6)).date().isoformat()
+
+
+def prev_snapshot(out: str, utc: str) -> str | None:
+    """Снимок, которым индекс закрывает ПРЕДЫДУЩИЕ сутки (последний опрос этих суток), в out/hl/ГГГГ/ММ/."""
+    want = (datetime.fromisoformat(snap_day(utc)) - timedelta(days=1)).date().isoformat()
+    best = None
+    for mon in {want[:7].replace("-", ""), utc[:6]}:
+        d = os.path.join(out, "hl", mon[:4], mon[4:6])
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            m = re.match(r"hl_(\d{8}_\d{4})_(daily|full)\.json(\.gz)?$", f)
+            if m and m.group(1) < utc[:13] and snap_day(m.group(1)) == want and (best is None or m.group(1) > best[0]):
+                best = (m.group(1), os.path.join(d, f))
+    return best[1] if best else None
+
+
+def decompose(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict, d_now, t_now,
+              prev_path: str | None) -> dict:
+    """
+    Изменение D и T к прошлым суткам (аудитор, 17.10): ценовая часть — вчерашний состав по сегодняшним
+    цене и σ минус вчерашнее значение; позиционная — сегодняшнее значение минус вчерашний состав по
+    сегодняшней цене. Сумма частей равна изменению точно. Вчера полный опрос — в позиционной части и смена
+    состава выборки (prev_kind).
+    """
+    if not prev_path or d_now is None:
+        return {}
+    snap = _read_snap(prev_path)
+    s0, pp = snap.get("summary") or {}, snap.get("positions") or []
+    if not pp or not s0.get("sigma") or not s0.get("mark"):
+        return {}
+    a = summarize(pp, s0.get("oi_btc"), s0["mark"], s0["sigma"], curve, sens=False)    # вчера как было
+    b = summarize(pp, oi, mark, sigma, curve, sens=False)                               # вчерашний состав, сегодня
+    if a.get("d") is None or b.get("d") is None:
+        return {}
+    out = {"prev_utc": snap.get("utc"), "prev_kind": snap.get("kind") or ("full" if _is_full(snap) else "daily"),
+           "d_prev": a["d"], "d_px": b["d"] - a["d"], "d_pos": d_now - b["d"]}
+    if t_now is not None and a.get("t") is not None and b.get("t") is not None:
+        out.update(t_prev=a["t"], t_px=b["t"] - a["t"], t_pos=t_now - b["t"])
+    return out
+
+
+def print_extras(s: dict) -> None:
+    """Разложение изменения D и разброс фактических входов — печать (аудитор, 17.10)."""
+    if s.get("d_prev") is not None and s.get("d") is not None:
+        full = "; вчера полный опрос — в позиционной части и смена состава выборки" if s.get("prev_kind") == "full" else ""
+        print(f"Изменение D к прошлым суткам ({s.get('prev_utc')}): {s['d'] - s['d_prev']:+.2f} = цена {s['d_px']:+.2f} "
+              f"+ позиции {s['d_pos']:+.2f}{full}")
+        if s.get("t_prev") is not None:
+            print(f"   T: {s['t'] - s['t_prev']:+.2f} = цена {s['t_px']:+.2f} + позиции {s['t_pos']:+.2f}")
+    if s.get("entry_disp") is not None:
+        lo, sh = s.get("entry_disp_long"), s.get("entry_disp_short")
+        print(f"Разброс фактических цен входа: {s['entry_disp']:.2f}% (лонги {'—' if lo is None else f'{lo:.2f}%'}, "
+              f"шорты {'—' if sh is None else f'{sh:.2f}%'}; позиций {s.get('entry_n')})")
+        print("   " + ENTRY_NOTE)
+
+
+def extras(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict, s: dict,
+           out: str, utc: str) -> dict:
+    """Дополнения строки 17.10; сбой здесь не мешает основной строке (печать и пустые колонки)."""
+    res = {}
+    try:
+        res.update(entry_disp(positions))
+    except Exception as exc:                                 # noqa: BLE001
+        print(f"[!] разброс входов не посчитан ({str(exc)[:80]})")
+    try:
+        res.update(decompose(positions, oi, mark, sigma, curve, s.get("d"), s.get("t"), prev_snapshot(out, utc)))
+    except Exception as exc:                                 # noqa: BLE001
+        print(f"[!] разложение изменения D не посчитано ({str(exc)[:80]})")
+    return res
 
 
 def ladder(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict,
@@ -885,7 +990,11 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
             "d_top_usd": f(s.get("d_top_usd"), 0), "d_top_type": s.get("d_top_type") or "",
             "d_top_lev": "" if s.get("d_top_lev") is None else s["d_top_lev"],
             "d_top_k": f(s.get("d_top_k"), 3), "d_top_dist": f(s.get("d_top_dist"), 3),
-            "d_top_rank": "" if s.get("d_top_rank") is None else s["d_top_rank"]}
+            "d_top_rank": "" if s.get("d_top_rank") is None else s["d_top_rank"],
+            "entry_disp": f(s.get("entry_disp"), 3), "entry_disp_long": f(s.get("entry_disp_long"), 3),
+            "entry_disp_short": f(s.get("entry_disp_short"), 3), "entry_n": s.get("entry_n", ""),
+            "prev_utc": s.get("prev_utc") or "", "prev_kind": s.get("prev_kind") or "",
+            **{k: f(s.get(k)) for k in ("d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos")}}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -941,6 +1050,7 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
             curve = MT.load_curve(cpath)
             summary = summarize(pos, P["oi"], P["mark"], sigma, curve)
             summary["ladder"] = ladder(pos, P["oi"], P["mark"], sigma, curve, whole=summary)
+            summary.update(extras(pos, P["oi"], P["mark"], sigma, curve, summary, out, now.strftime("%Y%m%d_%H%M")))
             sig_src = summary["sigma_src"] = "coinbase"
     except Exception as exc:                              # noqa: BLE001
         print(f"[!] Столп 3 в облаке не посчитан ({str(exc)[:80]}) — посчитает ноутбук")
@@ -977,6 +1087,7 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
               "—" if sm["pillar3"] is None else f"{sm['pillar3']:+.1f}")
         print_ladder(sm.get("ladder"))
         print_state(sm)
+        print_extras(sm)
     _append_log(os.path.join(out, "hl_log.csv"), {
         "utc": stamp, "kind": mode, "polled": n, "positions": len(pos), "errors": P["errors"],
         "minutes": f"{P['minutes']:.1f}", "cover_long": f"{L / P['oi']:.4f}",
@@ -1251,6 +1362,13 @@ def refill(csv_path: str | None = None, out: str = DATA_DIR) -> int:
             continue
         s = summarize(snap["positions"], s0["oi_btc"], s0["mark"], sig, curve)
         s["ladder"] = ladder(snap["positions"], s0["oi_btc"], s0["mark"], sig, curve, whole=s)
+        s.update(extras(snap["positions"], s0["oi_btc"], s0["mark"], sig, curve, s, out, r["utc"]))
+        prev_row = next((x for x in rows if x.get("utc") == s.get("prev_utc")), None)
+        if prev_row and prev_row.get("d") and s.get("d_prev") is not None and abs(float(prev_row["d"]) - s["d_prev"]) > 1e-3:
+            print(f"   [!] {r['utc']}: D прошлых суток по снимку {s['d_prev']:+.4f} ≠ строке ряда {prev_row['d']} — "
+                  f"разложение не дописано")
+            for k in ("prev_utc", "prev_kind", "d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos"):
+                s.pop(k, None)
         new = pillar_row(r["utc"], r["kind"], s, r.get("sigma_src", ""), r.get("polled", ""))
         if (r.get("pillar3") or "") != new["pillar3"] and not (
                 r.get("pillar3") and new["pillar3"] and abs(float(new["pillar3"]) - float(r["pillar3"])) <= 0.011):
@@ -1678,6 +1796,40 @@ def selftest() -> None:
         c40 = [r[3] for r in r40]
         assert sigma_at(r40, 39 * TC.DAY + 600_000) == TC.daily_vol(c40, 38) != TC.daily_vol(c40, 39)
         assert sigma_at(r40, 40 * TC.DAY) == TC.daily_vol(c40, 39)
+        # Аудитор 17.10: разброс фактических входов (взвешен размером; меньше 5 позиций — нет значения)
+        pe = [{"szi": 1.0, "entry": 100.0}, {"szi": 1.0, "entry": 110.0}, {"szi": -2.0, "entry": 105.0},
+              {"szi": 1.0, "entry": 90.0}, {"szi": -1.0, "entry": 120.0}, {"szi": 0.5, "entry": 0}]
+        ed = entry_disp(pe)
+        ws, xs = [1, 1, 2, 1, 1], [math.log(v) for v in (100, 110, 105, 90, 120)]
+        mu = sum(w * x for w, x in zip(ws, xs)) / 6
+        assert ed["entry_n"] == 5 and abs(ed["entry_disp"] - 100 * math.sqrt(sum(w * (x - mu) ** 2 for w, x in zip(ws, xs)) / 6)) < 1e-9
+        assert ed["entry_disp_long"] is None and ed["entry_disp_short"] is None
+        # Разложение изменения D: предыдущие сутки — последний опрос тех суток; цена + позиции = изменение точно
+        dec = os.path.join(tmp, "dec")
+        cv = {"k": list(TC.K_GRID), True: [TC.rw_prob(k, 7) for k in TC.K_GRID],
+              False: [TC.rw_prob(k, 7) for k in TC.K_GRID]}
+        p0 = [{"szi": 2.0, "liq": 78000.0, "entry": 81000.0}, {"szi": -1.5, "liq": 84000.0, "entry": 79000.0},
+              {"szi": 3.0, "liq": 76000.0, "entry": 80500.0}, {"szi": -0.5, "liq": 90000.0, "entry": 80000.0}]
+        p1 = p0[:3] + [{"szi": 4.0, "liq": 79000.0, "entry": 81500.0}]
+        os.makedirs(os.path.join(dec, "hl", "2026", "10"))
+        for u, kind, pp, mk in (("20261018_0010", "daily", p0, 80000.0), ("20261018_1500", "full", p0, 80200.0),
+                                ("20261019_0010", "daily", p0, 80500.0)):
+            with gzip.open(os.path.join(dec, "hl", "2026", "10", f"hl_{u}_{kind}.json.gz"), "wt", encoding="utf-8") as fh:
+                json.dump({"utc": u, "kind": kind, "summary": {"oi_btc": 10.0, "mark": mk, "sigma": 0.02},
+                           "positions": pp}, fh)
+        assert prev_snapshot(dec, "20261020_0010").endswith("hl_20261019_0010_daily.json.gz")   # конец 18.10
+        assert prev_snapshot(dec, "20261019_0010").endswith("hl_20261018_0010_daily.json.gz")   # 1500 — уже 18.10
+        assert prev_snapshot(dec, "20261018_0010") is None
+        now_s = summarize(p1, 10.0, 81000.0, 0.021, cv)
+        de = decompose(p1, 10.0, 81000.0, 0.021, cv, now_s["d"], now_s["t"], prev_snapshot(dec, "20261020_0010"))
+        was = summarize(p0, 10.0, 80500.0, 0.02, cv)
+        assert abs(de["d_prev"] - was["d"]) < 1e-12 and de["prev_kind"] == "daily"
+        assert abs(de["d_px"] + de["d_pos"] - (now_s["d"] - was["d"])) < 1e-12
+        assert abs(de["t_px"] + de["t_pos"] - (now_s["t"] - was["t"])) < 1e-12
+        same = decompose(p0, 10.0, 81000.0, 0.021, cv, summarize(p0, 10.0, 81000.0, 0.021, cv)["d"], None,
+                         prev_snapshot(dec, "20261020_0010"))
+        assert abs(same["d_pos"]) < 1e-12 and "t_px" not in same                     # состав тот же — только цена
+        assert decompose(p1, 10.0, 81000.0, 0.021, cv, now_s["d"], now_s["t"], None) == {}
     finally:
         g.update(saved)
         TC.load = saved_load
@@ -1690,7 +1842,8 @@ def selftest() -> None:
           "ежедневный режим с известными держателями, версия D (база — OI выборки, хрупкость = честный "
           "пересчёт, размер входит, двусторонний риск в T, дальние стопы только в базе), обрезка 6/8/12σ, "
           "дозаполнение ряда по снимкам, лестница глубин (знак — при согласии ступеней), три состояния знака D "
-          "и доли крупнейших вкладчиков сторон")
+          "и доли крупнейших вкладчиков сторон, разброс фактических цен входа, разложение изменения D и T "
+          "на ценовую и позиционную части (сумма точна; прошлые сутки — последний их опрос)")
 
 
 def main() -> None:
