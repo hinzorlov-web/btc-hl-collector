@@ -102,6 +102,9 @@ COINBASE = "https://api.exchange.coinbase.com/products/BTC-USD/candles"   # σ �
 # Строка ряда столпа 3: всё, чтобы объяснить день без повторного прогона (аудитор, 13.10 вечер):
 # границы зон, суммы, счета, доля крупнейшего, σ, кумулятивная 1/2/4σ с долями сторон,
 # нормировочная база (условные суммы лонгов и шортов в выборке), хрупкость, покрытие.
+# cover_long / cover_short — лонги (шорты) выборки, делённые на поле openInterest биржи. Это поле — СУММА обеих
+# сторон (найдено 18.10 по Reservoir, ошибка №82), поэтому доля рынка ≈ 2 × cover. Определение колонки не
+# менялось с 11.10 — в ряду одно определение; печать с 21.10 показывает обе величины.
 # Новые колонки дописываются в конец — старые строки сохраняются (_append_csv).
 P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", "zone_short_pct",
            "zone_long_pct", "zone_short_usd", "zone_long_usd", "acc_short", "acc_long", "top_short",
@@ -648,10 +651,11 @@ def print_summary(s: dict, top) -> None:
     print(f"\nHYPERLIQUID, BTC — цена {s['mark']:,.0f}; открытый интерес {s['oi_btc']:,.0f} BTC "
           f"(${s['oi_btc'] * s['mark'] / 1e9:.2f} млрд)")
     print(f"Счетов просмотрено {top}, позиций BTC найдено {s['n_pos']}")
-    print(f"ПОКРЫТИЕ: лонги {s['long_btc']:,.0f} BTC = {100 * s['cover_long']:.0f}% интереса, "
-          f"шорты {s['short_btc']:,.0f} BTC = {100 * s['cover_short']:.0f}%")
-    if s["cover_long"] and s["cover_long"] > 1.05:
-        print("   [!] Покрытие больше 100% — проверить единицы openInterest")
+    print(f"ПОКРЫТИЕ: лонги {s['long_btc']:,.0f} BTC ≈ {200 * s['cover_long']:.0f}% всех лонгов рынка, "
+          f"шорты {s['short_btc']:,.0f} BTC ≈ {200 * s['cover_short']:.0f}% всех шортов "
+          f"(к полю openInterest биржи — {100 * s['cover_long']:.0f}% / {100 * s['cover_short']:.0f}%: поле — сумма обеих сторон, №82)")
+    if s["cover_long"] and s["cover_long"] > 0.525:
+        print("   [!] Лонги выборки больше половины поля openInterest (> 100% рынка) — проверить единицы")
     print(f"Без цены ликвидации (залог не даёт ликвидации): лонги ${s['no_liq_long_usd'] / 1e6:,.0f} млн, "
           f"шорты ${s['no_liq_short_usd'] / 1e6:,.0f} млн")
     print(f"Типичный дневной ход (30 дней): {100 * s['sigma']:.2f}%\n")
@@ -1101,8 +1105,8 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
         "cover_short": f"{S / P['oi']:.4f}", "oi_btc": f"{P['oi']:.2f}", "mark": f"{P['mark']:.1f}",
         "active": "" if P["n_active"] is None else P["n_active"], "known": len(new_known),
         "t_start": P["t_start"], "t_end": P["t_end"]})
-    print(f"Снимок: {os.path.relpath(path, out)}; позиций {len(pos)}; покрытие лонги "
-          f"{100 * L / P['oi']:.0f}%, шорты {100 * S / P['oi']:.0f}%")
+    print(f"Снимок: {os.path.relpath(path, out)}; позиций {len(pos)}; покрытие рынка ≈ лонги "
+          f"{200 * L / P['oi']:.0f}%, шорты {200 * S / P['oi']:.0f}% (поле openInterest — сумма обеих сторон, №82)")
     return 0
 
 
