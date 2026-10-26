@@ -126,7 +126,10 @@ P3_COLS = ["utc", "kind", "sigma", "sigma_src", "pillar3", "p_short", "p_long", 
            # и разложение изменения D и T к прошлым суткам: цена (вчерашний состав по сегодняшним цене и σ)
            # + позиции (сегодняшний состав против вчерашнего по сегодняшней цене); сумма точна
            "entry_disp", "entry_disp_long", "entry_disp_short", "entry_n",
-           "prev_utc", "prev_kind", "d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos"]
+           "prev_utc", "prev_kind", "d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos",
+           # 26.10 (ошибка №101): цена = ликвидации ценой + переоценка; пройденные ликвидации убираются из вчерашнего
+           # состава до переоценки; range_src — откуда путь цены между снимками (свечи Coinbase или цены снимков)
+           "d_liq", "d_rev", "range_src"]
 ENTRY_NOTE = ("Разброс входов — только по ОТКРЫТЫМ позициям: закрытые и ликвидированные не видны, а это как раз "
               "крайние входы, — наблюдаемый разброс УЖЕ настоящего (выжившие; аудитор, 17.10). Описательно, вне композита.")
 LADDER = (2000, 10000, 20000)               # ступени лестницы глубин; последняя ступень — все опрошенные
@@ -501,13 +504,31 @@ def prev_snapshot(out: str, utc: str) -> str | None:
     return best[1] if best else None
 
 
+def _path_range(candles: list | None, ms0: int | None, ms1: int | None, p0: float, p1: float) -> tuple:
+    """Максимум и минимум цены между снимками: дневные свечи Coinbase, перекрывающие [ms0, ms1] больше чем на час;
+    без свечей — цены двух снимков (тогда ликвидации, пройденные только внутри дня, остаются в «позициях»)."""
+    hi, lo, src = max(p0, p1), min(p0, p1), "цены снимков"
+    if candles and ms0 and ms1:
+        sel = [c for c in candles if min(c[0] + TC.DAY, ms1) - max(c[0], ms0) > 3_600_000]
+        if sel:
+            hi, lo, src = max(hi, max(c[1] for c in sel)), min(lo, min(c[2] for c in sel)), "свечи Coinbase"
+    return hi, lo, src
+
+
+def _crossed(p: dict, p0: float, hi: float, lo: float) -> bool:
+    q = p.get("liq")
+    return bool(q and q > 0 and ((p["szi"] < 0 and p0 < q <= hi) or (p["szi"] > 0 and lo <= q < p0)))
+
+
 def decompose(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict, d_now, t_now,
-              prev_path: str | None) -> dict:
+              prev_path: str | None, candles: list | None = None, now_utc: str | None = None) -> dict:
     """
-    Изменение D и T к прошлым суткам (аудитор, 17.10): ценовая часть — вчерашний состав по сегодняшним
-    цене и σ минус вчерашнее значение; позиционная — сегодняшнее значение минус вчерашний состав по
-    сегодняшней цене. Сумма частей равна изменению точно. Вчера полный опрос — в позиционной части и смена
-    состава выборки (prev_kind).
+    Изменение D и T к прошлым суткам (аудитор, 17.10; исправлено 26.10 — ошибка №101): цена = ликвидации ценой
+    (вчерашние позиции, до цены ликвидации которых дошла цена между снимками, убираются при вчерашней цене) +
+    переоценка (оставшиеся вчерашние позиции при сегодняшних цене и σ); позиции — сегодняшнее значение минус
+    оставшийся вчерашний состав при сегодняшней цене (открытия, закрытия, залог). Сумма частей равна изменению точно.
+    До 26.10 пройденные ликвидации оставались во вчерашнем составе и при новой цене считались чужой стороной.
+    Вчера полный опрос — в позиционной части и смена состава выборки (prev_kind).
     """
     if not prev_path or d_now is None:
         return {}
@@ -515,12 +536,19 @@ def decompose(positions: list[dict], oi: float, mark: float, sigma: float, curve
     s0, pp = snap.get("summary") or {}, snap.get("positions") or []
     if not pp or not s0.get("sigma") or not s0.get("mark"):
         return {}
-    a = summarize(pp, s0.get("oi_btc"), s0["mark"], s0["sigma"], curve, sens=False)    # вчера как было
-    b = summarize(pp, oi, mark, sigma, curve, sens=False)                               # вчерашний состав, сегодня
-    if a.get("d") is None or b.get("d") is None:
+    p0 = s0["mark"]
+    ms0 = stamp_ms(snap["utc"]) if snap.get("utc") else None
+    ms1 = stamp_ms(now_utc) if now_utc else None
+    hi, lo, src = _path_range(candles, ms0, ms1, p0, mark)
+    surv = [p for p in pp if not _crossed(p, p0, hi, lo)]
+    a = summarize(pp, s0.get("oi_btc"), p0, s0["sigma"], curve, sens=False)            # вчера как было
+    a2 = summarize(surv, s0.get("oi_btc"), p0, s0["sigma"], curve, sens=False)         # без пройденных ликвидаций
+    b = summarize(surv, oi, mark, sigma, curve, sens=False)                             # оставшиеся, сегодня
+    if a.get("d") is None or b.get("d") is None or a2.get("d") is None:
         return {}
     out = {"prev_utc": snap.get("utc"), "prev_kind": snap.get("kind") or ("full" if _is_full(snap) else "daily"),
-           "d_prev": a["d"], "d_px": b["d"] - a["d"], "d_pos": d_now - b["d"]}
+           "d_prev": a["d"], "d_px": b["d"] - a["d"], "d_pos": d_now - b["d"],
+           "d_liq": a2["d"] - a["d"], "d_rev": b["d"] - a2["d"], "range_src": src}
     if t_now is not None and a.get("t") is not None and b.get("t") is not None:
         out.update(t_prev=a["t"], t_px=b["t"] - a["t"], t_pos=t_now - b["t"])
     return out
@@ -530,7 +558,9 @@ def print_extras(s: dict) -> None:
     """Разложение изменения D и разброс фактических входов — печать (аудитор, 17.10)."""
     if s.get("d_prev") is not None and s.get("d") is not None:
         full = "; вчера полный опрос — в позиционной части и смена состава выборки" if s.get("prev_kind") == "full" else ""
-        print(f"Изменение D к прошлым суткам ({s.get('prev_utc')}): {s['d'] - s['d_prev']:+.2f} = цена {s['d_px']:+.2f} "
+        liq = (f" (ликвидации ценой {s['d_liq']:+.2f}, переоценка {s['d_rev']:+.2f}; путь цены — {s.get('range_src')})"
+               if s.get("d_liq") is not None and s.get("d_rev") is not None else "")
+        print(f"Изменение D к прошлым суткам ({s.get('prev_utc')}): {s['d'] - s['d_prev']:+.2f} = цена {s['d_px']:+.2f}{liq} "
               f"+ позиции {s['d_pos']:+.2f}{full}")
         if s.get("t_prev") is not None:
             print(f"   T: {s['t'] - s['t_prev']:+.2f} = цена {s['t_px']:+.2f} + позиции {s['t_pos']:+.2f}")
@@ -542,7 +572,7 @@ def print_extras(s: dict) -> None:
 
 
 def extras(positions: list[dict], oi: float, mark: float, sigma: float, curve: dict, s: dict,
-           out: str, utc: str) -> dict:
+           out: str, utc: str, candles: list | None = None) -> dict:
     """Дополнения строки 17.10; сбой здесь не мешает основной строке (печать и пустые колонки)."""
     res = {}
     try:
@@ -550,7 +580,8 @@ def extras(positions: list[dict], oi: float, mark: float, sigma: float, curve: d
     except Exception as exc:                                 # noqa: BLE001
         print(f"[!] разброс входов не посчитан ({str(exc)[:80]})")
     try:
-        res.update(decompose(positions, oi, mark, sigma, curve, s.get("d"), s.get("t"), prev_snapshot(out, utc)))
+        res.update(decompose(positions, oi, mark, sigma, curve, s.get("d"), s.get("t"), prev_snapshot(out, utc),
+                             candles=candles, now_utc=utc))
     except Exception as exc:                                 # noqa: BLE001
         print(f"[!] разложение изменения D не посчитано ({str(exc)[:80]})")
     return res
@@ -1005,7 +1036,8 @@ def pillar_row(stamp: str, kind: str, s: dict, sig_src: str, polled: int) -> dic
             "entry_disp": f(s.get("entry_disp"), 3), "entry_disp_long": f(s.get("entry_disp_long"), 3),
             "entry_disp_short": f(s.get("entry_disp_short"), 3), "entry_n": s.get("entry_n", ""),
             "prev_utc": s.get("prev_utc") or "", "prev_kind": s.get("prev_kind") or "",
-            **{k: f(s.get(k)) for k in ("d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos")}}
+            **{k: f(s.get(k)) for k in ("d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos", "d_liq", "d_rev")},
+            "range_src": s.get("range_src") or ""}
 
 
 def collect(mode: str, top: int, workers: int, out: str, force: bool = False, now=None,
@@ -1056,12 +1088,14 @@ def collect(mode: str, top: int, workers: int, out: str, force: bool = False, no
     # не мешает сохранить снимок: тогда столп посчитает ноутбук (recompute).
     sig_src, cpath = None, os.path.join(HERE, "p3_touch_curve.csv")
     try:
-        sigma = sigma_at(_cb_daily(), stamp_ms(stamp))
+        cb = _cb_daily()
+        sigma = sigma_at(cb, stamp_ms(stamp))
         if sigma and os.path.isfile(cpath):
             curve = MT.load_curve(cpath)
             summary = summarize(pos, P["oi"], P["mark"], sigma, curve)
             summary["ladder"] = ladder(pos, P["oi"], P["mark"], sigma, curve, whole=summary)
-            summary.update(extras(pos, P["oi"], P["mark"], sigma, curve, summary, out, now.strftime("%Y%m%d_%H%M")))
+            summary.update(extras(pos, P["oi"], P["mark"], sigma, curve, summary, out, now.strftime("%Y%m%d_%H%M"),
+                                  candles=cb))
             sig_src = summary["sigma_src"] = "coinbase"
     except Exception as exc:                              # noqa: BLE001
         print(f"[!] Столп 3 в облаке не посчитан ({str(exc)[:80]}) — посчитает ноутбук")
@@ -1378,7 +1412,10 @@ def refill(csv_path: str | None = None, out: str = DATA_DIR) -> int:
         if prev_row and prev_row.get("d") and s.get("d_prev") is not None and abs(float(prev_row["d"]) - s["d_prev"]) > 1e-3:
             print(f"   [!] {r['utc']}: D прошлых суток по снимку {s['d_prev']:+.4f} ≠ строке ряда {prev_row['d']} — "
                   f"разложение не дописано")
-            for k in ("prev_utc", "prev_kind", "d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos"):
+            for k in ("prev_utc", "prev_kind", "d_prev", "d_px", "d_pos", "t_prev", "t_px", "t_pos", "d_liq", "d_rev", "range_src"):
+                s.pop(k, None)
+        if r.get("d_px"):                                  # разложение старым способом (до №101) — не смешивать в строке
+            for k in ("d_liq", "d_rev", "range_src"):
                 s.pop(k, None)
         new = pillar_row(r["utc"], r["kind"], s, r.get("sigma_src", ""), r.get("polled", ""))
         if (r.get("pillar3") or "") != new["pillar3"] and not (
@@ -1841,6 +1878,26 @@ def selftest() -> None:
                          prev_snapshot(dec, "20261020_0010"))
         assert abs(same["d_pos"]) < 1e-12 and "t_px" not in same                     # состав тот же — только цена
         assert decompose(p1, 10.0, 81000.0, 0.021, cv, now_s["d"], now_s["t"], None) == {}
+        # №101: шорт с ликвидацией 80 800 между ценами снимков (80 500 → 81 000) ликвидирован ценой — в «цену», а не в
+        # «позиции», и при новой цене не становится стопом чужой стороны
+        pz = p0 + [{"szi": -1.0, "liq": 80800.0, "entry": 80000.0}]
+        os.makedirs(os.path.join(dec, "hl", "2026", "11"))
+        with gzip.open(os.path.join(dec, "hl", "2026", "11", "hl_20261101_0010_daily.json.gz"), "wt", encoding="utf-8") as fh:
+            json.dump({"utc": "20261101_0010", "kind": "daily", "summary": {"oi_btc": 10.0, "mark": 80500.0, "sigma": 0.02},
+                       "positions": pz}, fh)
+        pv = prev_snapshot(dec, "20261102_0010")
+        dz = decompose(p0, 10.0, 81000.0, 0.021, cv, summarize(p0, 10.0, 81000.0, 0.021, cv)["d"], None, pv,
+                       now_utc="20261102_0010")
+        assert dz["range_src"] == "цены снимков" and abs(dz["d_pos"]) < 1e-12, dz         # остальное — тот же состав
+        assert abs(dz["d_liq"] + dz["d_rev"] - dz["d_px"]) < 1e-12 and dz["d_liq"] < 0, dz  # убран шорт сверху — D ниже
+        cnd = [(stamp_ms("20261101_0000"), 82500.0, 80000.0, 81000.0)]               # свеча: внутри дня до 82 500
+        pz2 = p0[:3] + [{"szi": -0.5, "liq": 82000.0, "entry": 80000.0}]
+        with gzip.open(os.path.join(dec, "hl", "2026", "11", "hl_20261101_0010_daily.json.gz"), "wt", encoding="utf-8") as fh:
+            json.dump({"utc": "20261101_0010", "kind": "daily", "summary": {"oi_btc": 10.0, "mark": 80500.0, "sigma": 0.02},
+                       "positions": pz2}, fh)
+        dc_ = decompose(p0[:3], 10.0, 81000.0, 0.021, cv, summarize(p0[:3], 10.0, 81000.0, 0.021, cv)["d"], None, pv,
+                        candles=cnd, now_utc="20261102_0010")
+        assert dc_["range_src"] == "свечи Coinbase" and abs(dc_["d_pos"]) < 1e-12, dc_     # 82 000 пройдена внутри дня
         # Запасной путь не увереннее основного (аудитор, 17.10): ступень без D — знак не установлен
         import contextlib
         import io
